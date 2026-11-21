@@ -507,6 +507,8 @@ TASTE_STOP = int(os.environ.get("BR_TASTE_STOP", "3"))
 SELF = os.environ.get("BR_SELF", "0") == "1"                      # run a record-looping heavy test on the records that reach the change
 SELF_RATIO = float(os.environ.get("BR_SELF_RATIO", "0.5"))
 SELF_FIRST = int(os.environ.get("BR_SELF_FIRST", "6"))
+WIDE_PROBE = os.environ.get("BR_WIDE_PROBE", "0") == "1"          # run the comparison probe even when most tests are selected
+MULTI = os.environ.get("BR_MULTI", "0") == "1"                    # check multi-file commits one file at a time
 HEAVYRUN = os.environ.get("BR_HEAVYRUN", "0") == "1"              # run expensive tests for real when that is cheap
 HEAVYRUN_RATIO = float(os.environ.get("BR_HEAVYRUN_RATIO", "0.5"))
 REFINE_RATIO = float(os.environ.get("BR_REFINE_RATIO", "0.6"))
@@ -597,6 +599,7 @@ class Checker:
         if self.v is None:
             from verify import Verifier
             self.v = Verifier(SG, os.environ.get("BR_TMP", "/tmp/br_wc"), PIN)
+        self.v.extra = self.extra          # the rest of a multi-file commit, applied in every real run
         return self.v
 
     def patched(self, text):
@@ -622,6 +625,8 @@ class Checker:
         first = self.v is None or not self.v.baseline
         r = self.start().state(patched, limit=min(25.0, self.left() - 5))
         self.cpu += self.v.last.get("cpu", 0) + (self.v.base_cpu if first else 0)
+        if os.environ.get("BR_DEBUG"):
+            log("state-cpu", name, self.v.last.get("cpu"), "base", self.v.base_cpu if first else 0)
         if r is None or r["n"] > 300:
             log("state", name, "import failed" if r is None else "many items", "-> all tests")
             return set(sel.all)
@@ -647,6 +652,8 @@ class Checker:
         log("state", name, r["n"], "items", r["changed"][:3], "->", len(got))
         return chosen | got
 
+    extra, norec = {}, frozenset()      # norec: fixture files this commit edits (their record numbers may shift)
+
     def failed_records(self, sel, proxy, result, spec):
         """(fixture file, record indexes) for the proxy's failing subtests, or None when that cannot be told."""
         if self.id[proxy] in set(result.get("whole", ())):
@@ -655,6 +662,8 @@ class Checker:
         if len(recmap) != 1:
             return None
         (fx, info), = recmap.items()
+        if fx in self.norec:
+            return None
         ran = (spec or {}).get("files", {}).get(fx)      # records the proxy was run on, when it was sliced
         idxs = set()
         for nodeid, msg in result.get("sub", ()):
@@ -684,6 +693,8 @@ class Checker:
         if not recmap or len(recmap) != 1:
             return None
         (fx, info), = recmap.items()
+        if fx in self.norec:
+            return None
         mask, seen = 0, False
         for f, lo, hi in sel.touched:
             static = sel.m["lines"].get(f, {})
@@ -707,6 +718,8 @@ class Checker:
             if len(recmap) != 1:
                 return None, None
             (fx, info), = recmap.items()
+            if fx in self.norec:
+                return None, None
             recs = list((spec or {}).get("files", {}).get(fx, range(info["n"])))
             if len(recs) < TASTE_MIN or fx in first:
                 return None, None
@@ -731,6 +744,8 @@ class Checker:
                 if any(l in bl for l in range(lo, hi + 1)):
                     return None, 1.0      # the change also runs outside the per-record loop: every record is affected
             for fx, info in recmap.items():
+                if fx in self.norec:
+                    return None, 1.0
                 mask = 0
                 for f, lo, hi in sel.touched:
                     d = info["lines"].get(f)
@@ -795,14 +810,17 @@ class Checker:
         return chosen - drop
 
     def _check(self, name, text, chosen, all_count, sel=None):
-        if not VERIFY or not chosen or len(chosen) > 0.5 * all_count or self.left() < 20:
+        if not VERIFY or not chosen or self.left() < 20:
+            return chosen
+        wide = len(chosen) > 0.5 * all_count        # nearly everything selected: only the comparison probe is worth its CPU
+        if wide and not WIDE_PROBE:
             return chosen
         if any(fp.old is None or fp.new is None or fp.old != fp.new for fp in parse_patch(text)):
             return chosen
         patched = self.patched(text)
         if patched is None:
             return chosen
-        if FIXSLICE and all(f.startswith("tests/fixtures/") and f.endswith(".sql") for f in patched) \
+        if FIXSLICE and not wide and all(f.startswith("tests/fixtures/") and f.endswith(".sql") for f in patched) \
                 and any(self.ms[n] >= HEAVY_SECS * 1000 for n in chosen) and self.left() > 30:
             # Only fixture records changed, and an expensive test reads the file. Run every candidate for real with the
             # fixture loaders yielding just the records that differ from the pinned commit: unchanged records behave
@@ -851,6 +869,8 @@ class Checker:
                     if pr.get("agree") and pr.get("n", 0) >= EQUIV_MIN_RUNS and pr.get("tests", 0) >= min(EQUIV_MIN_TESTS, len(chosen - heavy)):
                         return set()
                     chosen = chosen - set(pick)          # these passed for real; carry on with the rest
+        if wide:
+            return chosen
         # An expensive test that loops over fixture records, and a change that only some records reach: run the test
         # for real on just those records (cheapest first). Records that never reach the changed lines behave exactly
         # as before, so the test fails on the whole file if and only if it fails on these.
@@ -985,6 +1005,47 @@ class Checker:
         return set() if SKIP_HEAVY else heavy
 
 
+def by_file(name, text, sel, chk):
+    """A commit that edits several files: select and check each file's edit on its own, with the rest of the commit
+    applied whenever something is run for real, and take the union. Returns (static count, chosen) or None when the
+    commit is not a plain multi-file edit (then the caller handles it as one piece)."""
+    parts = [p for p in re.split(r"(?m)^(?=diff --git )", text) if p.strip()]
+    if len(parts) < 2:
+        return None
+    fps = parse_patch(text)
+    if len(fps) != len(parts) or any(fp.binary or fp.old is None or fp.new is None or fp.old != fp.new for fp in fps):
+        return None
+    whole = chk.patched(text)
+    if whole is None:
+        return None
+    full, fpend = sel.select(text)
+    full = set(full).union(*[p for _, p in fpend])
+    static = set()
+    for part in parts:
+        ch, pend = sel.select(part)
+        static |= set(ch).union(*[p for _, p in pend])
+    if static != full:
+        log("multi", name, "parts do not add up", len(static), len(full))
+        return None
+    if len(full) > 0.5 * len(sel.all) and not WIDE_PROBE:
+        return None
+    total = set()
+    for part in parts:
+        mine = chk.patched(part)
+        if mine is None:
+            return None
+        chk.extra = {f: v for f, v in whole.items() if f not in mine}
+        chk.norec = frozenset(f[len("tests/fixtures/"):] for f in whole if f.startswith("tests/fixtures/"))
+        ch, pend = sel.select(part)
+        if pend:
+            ch = chk.resolve(name, part, sel, ch, pend)
+        if ch:
+            ch = chk.check(name, part, ch, len(sel.all), sel)
+        total |= set(ch)
+    log("multi", name, "files", len(parts), "static", len(full), "->", len(total))
+    return len(full), total
+
+
 def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
@@ -1013,21 +1074,34 @@ def main():
     chk.deadline = T0 + float(os.environ.get("BR_BUDGET", "110" if len(patches) <= 45 else "170"))
     for patch in patches:
         text = patch.read_text(encoding="utf-8", errors="replace")
-        try:
-            chosen, pending = sel.select(text)
-            if pending:
-                chosen = chk.resolve(patch.stem, text, sel, chosen, pending)
-        except Exception as e:                 # never crash, never guess low
-            log("fallback", patch.stem, repr(e)); chosen = set(sel.all)
-        static_n = len(chosen)
-        try:
-            chosen = chk.check(patch.stem, text, chosen, len(sel.all), sel)
-        except Exception as e:
-            log("verify-error", patch.stem, repr(e))
+        multi = None
+        if MULTI:
+            try:
+                multi = by_file(patch.stem, text, sel, chk)
+            except Exception as e:
+                log("multi-error", patch.stem, repr(e))
+            finally:
+                chk.extra, chk.norec = {}, frozenset()
+        if multi is not None:
+            static_n, chosen = multi
+        else:
+            try:
+                chosen, pending = sel.select(text)
+                if pending:
+                    chosen = chk.resolve(patch.stem, text, sel, chosen, pending)
+            except Exception as e:                 # never crash, never guess low
+                log("fallback", patch.stem, repr(e)); chosen = set(sel.all)
+            static_n = len(chosen)
+            try:
+                chosen = chk.check(patch.stem, text, chosen, len(sel.all), sel)
+            except Exception as e:
+                log("verify-error", patch.stem, repr(e))
         if DROP_HEAVY:
             # DIAGNOSTIC ONLY: never select tests of 3 s or more. Used on the practice board to learn how many
             # commits truly need one (reported as misses) and how much they cost. Not for a final entry.
-            chosen = {n for n in chosen if ms[n] < HEAVY_SECS * 1000}
+            only = [x for x in os.environ.get("BR_DROP_ONLY", "").split(",") if x]
+            chosen = {n for n in chosen if ms[n] < HEAVY_SECS * 1000
+                      or (only and chk.id[n].rsplit("::", 1)[-1] not in only)}
         print(json.dumps({"commit": patch.stem, "workers": pack(chosen, ms)}), flush=True)
         log(patch.stem, static_n, len(chosen))
     if chk.v is not None:

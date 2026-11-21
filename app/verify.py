@@ -37,6 +37,8 @@ class Verifier:
                     if not link.is_symlink() and not link.exists():
                         os.symlink(os.path.join(d, name), link)
 
+    extra = {}
+
     def state(self, patched, limit=60):
         """Changed import-state items for this patch, or None when the patched package cannot be imported."""
         if not self.baseline:
@@ -46,7 +48,7 @@ class Verifier:
             if not self.baseline:
                 self.last = b
                 return None
-        r = self._request(patched, {"op": "state", "limit": limit})
+        r = self._request({**self.extra, **patched}, {"op": "state", "limit": limit})
         self.last = r
         if not r.get("ok"):
             return None
@@ -54,6 +56,7 @@ class Verifier:
 
     def run(self, patched, ids, stop=True, limit=60, probe=None, collect_only=False, slice=None, max_sub=0, duck=True):
         """patched: {relative path: new text or None (deleted)}. Returns the zygote's result dict."""
+        patched = {**self.extra, **patched}
         req = {"ids": ids, "stop": stop, "limit": limit}
         if collect_only:
             req["collect_only"] = True
