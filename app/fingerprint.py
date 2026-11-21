@@ -94,7 +94,25 @@ def canon(o, depth=DEPTH, seen=None):
 
 
 def h(text):
-    return hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=6).hexdigest()
+    # Snapshots are only ever compared between processes forked from the same parent (same string-hash seed),
+    # so Python's own string hash is enough and much cheaper than a cryptographic one.
+    return hash(text)
+
+
+_MEMO = {}
+_PLAIN = (bool, int, float, complex, str, bytes, type(None))
+
+
+def canon_top(o):
+    """canon(o) for a top-level value, remembered per object: the same function or table is often reachable from
+    many class dictionaries (inherited entries), and its description does not depend on where it was found."""
+    if isinstance(o, _PLAIN):
+        return repr(o)
+    k = id(o)
+    r = _MEMO.get(k)
+    if r is None:
+        r = _MEMO[k] = canon(o)
+    return r
 
 
 def classes_of(m):
@@ -118,6 +136,7 @@ SKIP_ATTRS = {"__module__", "__qualname__", "__doc__", "__dict__", "__weakref__"
 
 def snapshot(modnames):
     out = {}
+    _MEMO.clear()
     for mn in modnames:
         m = sys.modules.get(mn)
         if m is None:
@@ -132,9 +151,9 @@ def snapshot(modnames):
                 if type(v) is dict:
                     out[key] = h("dict")
                     for k, x in dict.items(v):
-                        out[key + "[" + kr(k) + "]"] = h(canon(x))
+                        out[key + "[" + kr(k) + "]"] = h(canon_top(x))
                 else:
-                    out[key] = h(canon(v))
+                    out[key] = h(canon_top(v))
             except Exception as e:
                 out[key] = "err:" + type(e).__name__
         for c in classes_of(m):
@@ -151,9 +170,9 @@ def snapshot(modnames):
                     if type(v) is dict:
                         out[key] = h("dict")
                         for k, x in dict.items(v):
-                            out[key + "[" + kr(k) + "]"] = h(canon(x))
+                            out[key + "[" + kr(k) + "]"] = h(canon_top(x))
                     else:
-                        out[key] = h(canon(v))
+                        out[key] = h(canon_top(v))
                 except Exception as e:
                     out[key] = "err:" + type(e).__name__
     return out

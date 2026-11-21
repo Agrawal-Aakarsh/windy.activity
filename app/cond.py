@@ -25,34 +25,59 @@ def data():
     return _DATA
 
 
-def _diff(x, y):
-    """Smallest pair of nodes (old, new) containing the only difference, or None if identical / more than one place."""
-    if ast.dump(x) == ast.dump(y):
-        return None
+def _clean(node, lines):
+    """True when the patch changes no line of this node (old file line numbers), so it cannot differ."""
+    if lines is None:
+        return False
+    a = getattr(node, "lineno", None)
+    if a is None:
+        return False
+    b = getattr(node, "end_lineno", a) or a
+    if b - a > 400:
+        return not any(a <= l <= b for l in lines)
+    return not any(l in lines for l in range(a, b + 1))
+
+
+def _diff(x, y, lines=None):
+    """Smallest pair of nodes (old, new) containing the only difference, or None if identical / more than one place.
+    `lines` (old line numbers the patch touches) lets whole untouched subtrees be skipped without comparing them."""
     if type(x) is not type(y):
         return x, y
-    kids = []
+    if lines is None or not (hasattr(x, "lineno") or isinstance(x, ast.Module)):
+        if ast.dump(x) == ast.dump(y):
+            return None
+    found = []
     for (_, va), (_, vb) in zip(ast.iter_fields(x), ast.iter_fields(y)):
         if isinstance(va, ast.AST) and isinstance(vb, ast.AST):
-            if ast.dump(va) != ast.dump(vb):
-                kids.append((va, vb))
+            pairs = [(va, vb)]
         elif isinstance(va, list) and isinstance(vb, list):
             if len(va) != len(vb):
                 return x, y
+            pairs = []
             for p, q in zip(va, vb):
                 if isinstance(p, ast.AST) and isinstance(q, ast.AST):
-                    if ast.dump(p) != ast.dump(q):
-                        kids.append((p, q))
+                    pairs.append((p, q))
                 elif p != q:
                     return x, y
         elif va != vb:
             return x, y
-    if len(kids) != 1:
-        return x, y
-    p, q = kids[0]
-    if isinstance(p, OPS) or isinstance(q, OPS):
-        return x, y
-    return _diff(p, q)
+        else:
+            continue
+        for p, q in pairs:
+            if _clean(p, lines):
+                continue
+            if isinstance(p, OPS) or isinstance(q, OPS):
+                if type(p) is not type(q):
+                    return x, y                 # the operator itself changed: the difference is this node
+                continue
+            r = _diff(p, q, lines)
+            if r is not None:
+                found.append(r)
+                if len(found) > 1:
+                    return x, y
+    if not found:
+        return None
+    return found[0]
 
 
 def _parents(tree):
@@ -162,7 +187,7 @@ def _skip(node, dumps, pos):
             _skip(v, dumps, pos)
 
 
-def touched(rel, old_src, new_src):
+def touched(rel, old_src, new_src, parse=ast.parse, lines=None):
     """(mask of tests that may behave differently, mask of tests the recorder has data for, description) or None
     when the edit is not a one-condition edit this module understands."""
     d = data()
@@ -170,10 +195,10 @@ def touched(rel, old_src, new_src):
     if not table:
         return None
     try:
-        a, b = ast.parse(old_src), ast.parse(new_src)
+        a, b = parse(old_src), parse(new_src)
     except SyntaxError:
         return None
-    pair = _diff(a, b)
+    pair = _diff(a, b, lines)
     if pair is None:
         return None
     x, y = pair

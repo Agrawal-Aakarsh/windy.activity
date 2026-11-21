@@ -6,6 +6,7 @@ which tests use which classes, and static name references. Nothing here is keyed
 specific patch or on a kind of edit; every rule is "which tests can observe this line".
 """
 import ast
+import copy
 import json
 import os
 import pickle
@@ -260,7 +261,7 @@ class Selector:
         old_src = (SG / f).read_text(encoding="utf-8")
         new_src = fp.apply(old_src)
         try:
-            new_tree = ast.parse(new_src)
+            new_tree = parse_src(new_src)
         except SyntaxError:
             # the module can no longer be imported: its users for sure, and the import check decides the rest
             self.pending.append(("module", set(self.all)))
@@ -272,8 +273,16 @@ class Selector:
         squash = lambda lines: re.sub(r"\s+", "", "".join(l.split("#")[0] for l in lines))
         if squash(fp.removed_text()) == squash(fp.added_text()):
             # only comments, blank lines or layout differ on the face of it: confirm on the syntax trees
-            if ast.dump(ast.parse(old_src)) == ast.dump(new_tree):
+            import cond
+            if cond._diff(parse_src(old_src), new_tree, set(fp.removed) | set(fp.insert_points)) is None:
                 return set()                    # identical program
+        if NOOP:
+            try:
+                if same_program_at(fp, parse_src(old_src), new_tree, f):
+                    log("same-code", f)
+                    return set()                # every changed function still compiles to the same instructions
+            except Exception:
+                pass
         out = set()
         nlines = self.struct[f]["nlines"]
         targets = set(fp.removed)
@@ -304,7 +313,7 @@ class Selector:
             return whole
         old_src = (SG / f).read_text(encoding="utf-8")
         try:
-            old_tree, new_tree = ast.parse(old_src), ast.parse(fp.apply(old_src))
+            old_tree, new_tree = parse_src(old_src), parse_src(fp.apply(old_src))
         except SyntaxError:
             return whole
         if ast.dump(old_tree) == ast.dump(new_tree):
@@ -392,12 +401,19 @@ class Selector:
             out |= (rt & self.T(self.used[owner])) if cls and owner in self.used else rt
         return out
 
+    _last = None
+
     def select(self, text):
         """Returns (tests reachable at run time, [static answers for import-time effects])."""
+        if self._last is not None and self._last[0] == text:      # asked again for the same patch text
+            _, out, pending, touched, line_only = self._last
+            self.pending, self.touched, self.line_only = [(m, set(p)) for m, p in pending], list(touched), line_only
+            return set(out), self.pending
         self.pending, self.touched, self.line_only = [], [], True
         out = self._select(text)
         if self.pending:
             self.line_only = False            # some candidates come from import-time state, not from executed lines
+        self._last = (text, set(out), [(m, set(p)) for m, p in self.pending], list(self.touched), self.line_only)
         return out, self.pending
 
     def _select(self, text):
@@ -522,6 +538,7 @@ SELF = os.environ.get("BR_SELF", "0") == "1"                      # run a record
 SELF_RATIO = float(os.environ.get("BR_SELF_RATIO", "0.5"))
 SELF_FIRST = int(os.environ.get("BR_SELF_FIRST", "6"))
 WIDE_PROBE = os.environ.get("BR_WIDE_PROBE", "0") == "1"          # run the comparison probe even when most tests are selected
+NOOP = os.environ.get("BR_NOOP", "0") == "1"                      # edits whose functions compile to identical code select nothing
 FILL = os.environ.get("BR_FILL", "0") == "1"                      # put ruled-out candidates into free worker time
 COND = os.environ.get("BR_COND", "0") == "1"                      # use recorded condition values (cond.pkl.z)
 MULTI = os.environ.get("BR_MULTI", "0") == "1"                    # check multi-file commits one file at a time
@@ -558,7 +575,7 @@ def compare_swap(old_src, new_src):
     """If the only difference between two versions of a module is the operator of one two-operand comparison whose
     operands are plain names/attributes/constants, describe it; otherwise None."""
     try:
-        a, b = ast.parse(old_src), ast.parse(new_src)
+        a, b = parse_src(old_src), parse_src(new_src)
     except SyntaxError:
         return None
     found = []
@@ -1068,6 +1085,174 @@ class Checker:
         return set() if SKIP_HEAVY else heavy
 
 
+_TREES = {}
+
+
+def parse_src(src):
+    """ast.parse with a small memo: the same file text is parsed several times per commit. Shared trees: read-only."""
+    key = (len(src), hash(src))
+    t = _TREES.get(key)
+    if t is None:
+        if len(_TREES) > 12:
+            _TREES.clear()
+        t = _TREES[key] = ast.parse(src)
+    return t
+
+
+def _code_same(a, b):
+    """Two compiled functions/classes that execute the same instructions on the same constants and names.
+    Line numbers and the names of plain local variables are ignored: neither can change what the code does."""
+    if a.co_code != b.co_code or a.co_exceptiontable != b.co_exceptiontable:
+        return False
+    if (a.co_argcount, a.co_posonlyargcount, a.co_kwonlyargcount, a.co_flags, a.co_names, a.co_freevars, a.co_cellvars,
+            a.co_name, a.co_qualname, len(a.co_varnames), len(a.co_consts)) != \
+       (b.co_argcount, b.co_posonlyargcount, b.co_kwonlyargcount, b.co_flags, b.co_names, b.co_freevars, b.co_cellvars,
+            b.co_name, b.co_qualname, len(b.co_varnames), len(b.co_consts)):
+        return False
+    nargs = a.co_argcount + a.co_kwonlyargcount + bool(a.co_flags & 0x04) + bool(a.co_flags & 0x08)
+    if a.co_varnames[:nargs] != b.co_varnames[:nargs]:
+        return False                              # parameter names are part of the call interface
+    if a.co_varnames != b.co_varnames and {"locals", "vars", "eval", "exec", "dir"} & set(a.co_names):
+        return False                              # code that can look at its own local names
+    for x, y in zip(a.co_consts, b.co_consts):
+        if hasattr(x, "co_code") or hasattr(y, "co_code"):
+            if not (hasattr(x, "co_code") and hasattr(y, "co_code") and _code_same(x, y)):
+                return False
+        elif type(x) is not type(y) or repr(x) != repr(y):
+            return False
+    return True
+
+
+def _stmts_same(xs, ys, name):
+    if len(xs) != len(ys):
+        return False
+    for x, y in zip(xs, ys):
+        if ast.dump(x) == ast.dump(y):
+            continue
+        if isinstance(x, ast.ClassDef) and isinstance(y, ast.ClassDef) and x.name == y.name and \
+                ast.dump(ast.ClassDef(x.name, x.bases, x.keywords, [], x.decorator_list, getattr(x, "type_params", []))) == \
+                ast.dump(ast.ClassDef(y.name, y.bases, y.keywords, [], y.decorator_list, getattr(y, "type_params", []))):
+            if not _stmts_same(x.body, y.body, name):
+                return False
+            continue
+        if not (isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) and type(x) is type(y)):
+            return False                          # a differing class-level or module-level statement: not our case
+        try:
+            ca = compile(ast.Module([x], []), name, "exec", dont_inherit=True)
+            cb = compile(ast.Module([y], []), name, "exec", dont_inherit=True)
+        except Exception:
+            return False
+        if not _code_same(ca, cb):
+            return False
+    return True
+
+
+class _DropNoOps(ast.NodeTransformer):
+    """Remove statements that cannot do anything: `pass`, a bare constant, and inside a function an assignment of a
+    constant to a plain local name that the function never reads."""
+
+    def _body(self, stmts, dead=()):
+        out = []
+        for i, st in enumerate(stmts):
+            if isinstance(st, ast.Pass):
+                continue
+            if isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant) and not (i == 0 and isinstance(st.value.value, str)):
+                continue
+            if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name) \
+                    and isinstance(st.value, ast.Constant) and st.targets[0].id in dead:
+                continue
+            out.append(st)
+        return out or [ast.Pass()]
+
+    def generic_visit(self, node):
+        super().generic_visit(node)
+        dead = ()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            read, blocked = set(), False
+            for n in ast.walk(node):
+                if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Store):
+                    read.add(n.id)
+                elif isinstance(n, (ast.Global, ast.Nonlocal)):
+                    read.update(n.names)
+                elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+                    read.add(n.target.id)        # x += 1 reads x
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("locals", "vars", "eval", "exec", "dir"):
+                    blocked = True
+            if not blocked:
+                stored = {n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+                dead = stored - read
+        for field in ("body", "orelse", "finalbody"):
+            v = getattr(node, field, None)
+            if isinstance(v, list) and v and isinstance(v[0], ast.stmt):
+                setattr(node, field, self._body(v, dead) if field == "body" or v else v)
+        return node
+
+
+def _outer_functions(tree):
+    """{qualified name: node} for functions at module level and methods of (nested) classes."""
+    out = {}
+    def rec(body, prefix):
+        for st in body:
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                key = prefix + st.name
+                out[key] = None if key in out else st       # a name defined twice: ambiguous, never matched
+            elif isinstance(st, ast.ClassDef):
+                rec(st.body, prefix + st.name + ".")
+    rec(tree.body, "")
+    return out
+
+
+def same_program_at(fp, old_tree, new_tree, name):
+    """Like same_program, but only looks at the functions the patch touches (cheap on very large files).
+    False unless every changed line, on both sides, sits inside a function that exists in both versions."""
+    try:
+        old_lines = set(fp.removed) | set(fp.insert_points)
+        new_lines, delta = set(), 0
+        for start, body in fp.hunks:
+            n = start + delta
+            for tag, _ in body:
+                if tag == "+":
+                    new_lines.add(n); n += 1; delta += 1
+                elif tag == "-":
+                    new_lines.add(n); delta -= 1          # the line now at the place of a removal
+                else:
+                    n += 1
+        fo, fn = _outer_functions(old_tree), _outer_functions(new_tree)
+        if set(fo) != set(fn):
+            return False
+        touched = set()
+        for lines, funcs in ((old_lines, fo), (new_lines, fn)):
+            spans = [(v.lineno, v.end_lineno, k) for k, v in funcs.items() if v is not None]
+            for ln in lines:
+                hit = [k for a, b, k in spans if a <= ln <= b]
+                if len(hit) != 1:
+                    return False
+                touched.add(hit[0])
+        for k in touched:
+            x, y = fo[k], fn[k]
+            if x is None or y is None:
+                return False
+            a, b = _DropNoOps().visit(ast.Module([copy.deepcopy(x)], [])), _DropNoOps().visit(ast.Module([copy.deepcopy(y)], []))
+            if ast.dump(a) != ast.dump(b) and not _stmts_same(a.body, b.body, name):
+                return False
+        return bool(touched)
+    except Exception:
+        return False
+
+
+def same_program(old_tree, new_tree, name):
+    """True when the edit cannot change what the file does: after removing statements that do nothing, the two
+    versions are the same tree, or every function that still differs compiles to the same instructions (for example
+    a renamed local variable, or code after a return)."""
+    try:
+        a, b = _DropNoOps().visit(old_tree), _DropNoOps().visit(new_tree)
+        if ast.dump(a) == ast.dump(b):
+            return True
+        return _stmts_same(a.body, b.body, name)
+    except Exception:
+        return False
+
+
 def cond_trim(name, text, sel, chosen, pending):
     """One-condition edits (a swapped comparison or and/or, an added or removed `not`) in run-time code: keep only
     the tests in which the old and the new condition could ever give a different answer, according to the values
@@ -1083,7 +1268,7 @@ def cond_trim(name, text, sel, chosen, pending):
         return chosen
     import cond
     old = (SG / fp.old).read_text(encoding="utf-8")
-    r = cond.touched(fp.old, old, fp.apply(old))
+    r = cond.touched(fp.old, old, fp.apply(old), parse_src, set(fp.removed) | set(fp.insert_points))
     if r is None:
         return chosen
     hit, ran, what = r
