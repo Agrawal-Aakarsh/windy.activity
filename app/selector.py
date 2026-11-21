@@ -508,6 +508,7 @@ SELF = os.environ.get("BR_SELF", "0") == "1"                      # run a record
 SELF_RATIO = float(os.environ.get("BR_SELF_RATIO", "0.5"))
 SELF_FIRST = int(os.environ.get("BR_SELF_FIRST", "6"))
 WIDE_PROBE = os.environ.get("BR_WIDE_PROBE", "0") == "1"          # run the comparison probe even when most tests are selected
+COND = os.environ.get("BR_COND", "0") == "1"                      # use recorded condition values (cond.pkl.z)
 MULTI = os.environ.get("BR_MULTI", "0") == "1"                    # check multi-file commits one file at a time
 HEAVYRUN = os.environ.get("BR_HEAVYRUN", "0") == "1"              # run expensive tests for real when that is cheap
 HEAVYRUN_RATIO = float(os.environ.get("BR_HEAVYRUN_RATIO", "0.5"))
@@ -1003,6 +1004,33 @@ class Checker:
         return set() if SKIP_HEAVY else heavy
 
 
+def cond_trim(name, text, sel, chosen, pending):
+    """One-condition edits (a swapped comparison or and/or, an added or removed `not`) in run-time code: keep only
+    the tests in which the old and the new condition could ever give a different answer, according to the values
+    each test was seen to produce there at the pinned commit. A test where they always agree runs exactly as before."""
+    if not COND or pending or not chosen:
+        return chosen
+    fps = parse_patch(text)
+    if len(fps) != 1:
+        return chosen
+    fp = fps[0]
+    if fp.binary or fp.old is None or fp.new is None or fp.old != fp.new or not fp.old.endswith(".py"):
+        return chosen
+    import cond
+    old = (SG / fp.old).read_text(encoding="utf-8")
+    r = cond.touched(fp.old, old, fp.apply(old))
+    if r is None:
+        return chosen
+    hit, ran, what = r
+    keep = set()
+    for n in chosen:
+        i = sel.rev.get(n)
+        if i is None or not (ran >> i & 1) or (hit >> i & 1):
+            keep.add(n)                      # may differ, or the recorder has nothing on this test
+    log("cond", name, what, len(chosen), "->", len(keep))
+    return keep
+
+
 def by_file(name, text, sel, chk):
     """A commit that edits several files: select and check each file's edit on its own, with the rest of the commit
     applied whenever something is run for real, and take the union. Returns (static count, chosen) or None when the
@@ -1035,6 +1063,7 @@ def by_file(name, text, sel, chk):
         chk.extra = {f: v for f, v in whole.items() if f not in mine}
         chk.norec = frozenset(f[len("tests/fixtures/"):] for f in whole if f.startswith("tests/fixtures/"))
         ch, pend = sel.select(part)
+        ch = cond_trim(name, part, sel, ch, pend)
         if pend:
             ch = chk.resolve(name, part, sel, ch, pend)
         if ch:
@@ -1085,6 +1114,10 @@ def main():
         else:
             try:
                 chosen, pending = sel.select(text)
+                try:
+                    chosen = cond_trim(patch.stem, text, sel, chosen, pending)
+                except Exception as e:
+                    log("cond-error", patch.stem, repr(e))
                 if pending:
                     chosen = chk.resolve(patch.stem, text, sel, chosen, pending)
             except Exception as e:                 # never crash, never guess low

@@ -76,6 +76,13 @@ class Conn:
     def __getattr__(self, name):
         return getattr(self._c, name)
 
+    def __enter__(self):                         # `with duckdb.connect() as c:` must keep working
+        self._c.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._c.__exit__(*exc)
+
 
 def install():
     try:
