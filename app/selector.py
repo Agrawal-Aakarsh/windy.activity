@@ -499,6 +499,7 @@ EQUIV_MIN_RUNS = int(os.environ.get("BR_EQUIV_MIN_RUNS", "20"))
 EQUIV_MIN_TESTS = int(os.environ.get("BR_EQUIV_MIN_TESTS", "3"))
 SLICE = os.environ.get("BR_SLICE", "1") == "1"                    # run fixture-driven proxies only on the records that reach the change
 FIXSLICE = os.environ.get("BR_FIXSLICE", "0") == "1"              # fixture-only patches: run candidates on the changed records only
+DROP_HEAVY = os.environ.get("BR_DROP_HEAVY", "0") == "1"          # diagnostic, see main()
 PROXY = os.environ.get("BR_PROXY", "0") == "1"
 PROXY_SIM = float(os.environ.get("BR_PROXY_SIM", "0.6"))
 
@@ -815,6 +816,10 @@ def main():
             chosen = chk.check(patch.stem, text, chosen, len(sel.all), sel)
         except Exception as e:
             log("verify-error", patch.stem, repr(e))
+        if DROP_HEAVY:
+            # DIAGNOSTIC ONLY: never select tests of 3 s or more. Used on the practice board to learn how many
+            # commits truly need one (reported as misses) and how much they cost. Not for a final entry.
+            chosen = {n for n in chosen if ms[n] < HEAVY_SECS * 1000}
         print(json.dumps({"commit": patch.stem, "workers": pack(chosen, ms)}), flush=True)
         log(patch.stem, static_n, len(chosen))
     if chk.v is not None:
