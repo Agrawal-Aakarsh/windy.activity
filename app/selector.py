@@ -465,7 +465,9 @@ class Selector:
         return out
 
 
-def pack(nums, ms):
+def pack(nums, ms, spare=()):
+    """Split the chosen tests over 1..8 workers at the lowest cost. `spare` are tests that were candidates but got
+    ruled out: they are added back wherever they fit without raising the busiest worker, which costs nothing."""
     if not nums:
         return []
     order = sorted(nums, key=lambda n: -ms[n])
@@ -476,8 +478,18 @@ def pack(nums, ms):
             i = loads.index(min(loads)); workers[i].append(n); loads[i] += ms[n]
         cost = max(loads) + 2000 * k
         if best is None or cost < best[0]:
-            best = (cost, workers)
-    return [w for w in best[1] if w]
+            best = (cost, workers, loads)
+    workers, loads = best[1], best[2]
+    keep = [i for i, w in enumerate(workers) if w]
+    workers, loads = [workers[i] for i in keep], [loads[i] for i in keep]
+    if FILL and spare:
+        top = max(loads) - 2                      # stay strictly under the busiest worker (ms)
+        for n in sorted(set(spare) - set(nums), key=lambda n: ms[n]):
+            i = loads.index(min(loads))
+            if loads[i] + ms[n] > top and ms[n] > 0:
+                break                             # sorted by time: nothing later fits either
+            workers[i].append(n); loads[i] += ms[n]
+    return workers
 
 
 PIN = os.environ.get("BR_PIN", str(Path(__file__).with_name("unstable.json")))   # state items whose value varies run to run
@@ -508,6 +520,7 @@ SELF = os.environ.get("BR_SELF", "0") == "1"                      # run a record
 SELF_RATIO = float(os.environ.get("BR_SELF_RATIO", "0.5"))
 SELF_FIRST = int(os.environ.get("BR_SELF_FIRST", "6"))
 WIDE_PROBE = os.environ.get("BR_WIDE_PROBE", "0") == "1"          # run the comparison probe even when most tests are selected
+FILL = os.environ.get("BR_FILL", "0") == "1"                      # put ruled-out candidates into free worker time
 COND = os.environ.get("BR_COND", "0") == "1"                      # use recorded condition values (cond.pkl.z)
 MULTI = os.environ.get("BR_MULTI", "0") == "1"                    # check multi-file commits one file at a time
 HEAVYRUN = os.environ.get("BR_HEAVYRUN", "0") == "1"              # run expensive tests for real when that is cheap
@@ -618,6 +631,7 @@ class Checker:
     def resolve(self, name, text, sel, chosen, pending):
         """Edits that take effect while sqlglot is imported: import the patched package once and
         see which pieces of import-time state actually changed, then select the tests that read them."""
+        self.state_clean = False
         static = set().union(*[p for _, p in pending])
         patched = self.patched(text) if STATE else None
         if patched is None or self.left() < 15:
@@ -646,6 +660,7 @@ class Checker:
             # unusual, so those keep their static answer; import-time function lines add nothing.
             extra = set().union(*[p for mode, p in pending if mode == "level"]) if STATE_EMPTY_KEEPS_STATIC else set()
             log("state", name, "no change", len(extra))
+            self.state_clean = not extra and not r.get("failed_modules")
             return chosen | extra
         gone = {sel.struct[fp.old]["module"] for fp in parse_patch(text)
                 if fp.old in sel.struct and (fp.new is None or fp.new != fp.old)}
@@ -653,6 +668,7 @@ class Checker:
         log("state", name, r["n"], "items", r["changed"][:3], "->", len(got))
         return chosen | got
 
+    state_clean = False
     extra, norec = {}, frozenset()      # norec: fixture files this commit edits (their record numbers may shift)
 
     def failed_records(self, sel, proxy, result, spec):
@@ -842,7 +858,7 @@ class Checker:
         # A patch that only swaps the operator of one comparison: run some of the cheapest candidates and apply the
         # old and the new operator side by side to the values that actually reach that line (and to nearby inputs).
         # If the two never disagree over enough executions, the change is not observable and nothing needs to run.
-        if EQUIV and len(patched) == 1 and self.left() > 20:
+        if EQUIV and not getattr(sel, "cond_applied", False) and len(patched) == 1 and self.left() > 20:
             (rel, new_src), = patched.items()
             hunk = "\n".join(t for fp in parse_patch(text) for t in fp.added_text() + fp.removed_text())
             sw = compare_swap((SG / rel).read_text(encoding="utf-8"), new_src) if re.search(r"==|!=|<|>|\bis\b|\bin\b", hunk) else None
@@ -1008,6 +1024,7 @@ def cond_trim(name, text, sel, chosen, pending):
     """One-condition edits (a swapped comparison or and/or, an added or removed `not`) in run-time code: keep only
     the tests in which the old and the new condition could ever give a different answer, according to the values
     each test was seen to produce there at the pinned commit. A test where they always agree runs exactly as before."""
+    sel.cond_applied = False
     if not COND or pending or not chosen:
         return chosen
     fps = parse_patch(text)
@@ -1028,6 +1045,7 @@ def cond_trim(name, text, sel, chosen, pending):
         if i is None or not (ran >> i & 1) or (hit >> i & 1):
             keep.add(n)                      # may differ, or the recorder has nothing on this test
     log("cond", name, what, len(chosen), "->", len(keep))
+    sel.cond_applied = True
     return keep
 
 
@@ -1066,6 +1084,8 @@ def by_file(name, text, sel, chk):
         ch = cond_trim(name, part, sel, ch, pend)
         if pend:
             ch = chk.resolve(name, part, sel, ch, pend)
+            if chk.state_clean:              # importing the edited code changed nothing: only run-time use matters
+                ch = cond_trim(name, part, sel, ch, [])
         if ch:
             ch = chk.check(name, part, ch, len(sel.all), sel)
         total |= set(ch)
@@ -1101,6 +1121,11 @@ def main():
     chk.deadline = T0 + float(os.environ.get("BR_BUDGET", "110" if len(patches) <= 45 else "170"))
     for patch in patches:
         text = patch.read_text(encoding="utf-8", errors="replace")
+        try:                                       # every test the plain line/state rules point at, before any narrowing
+            c0, p0 = sel.select(text)
+            candidates = set(c0).union(*[p for _, p in p0])
+        except Exception:
+            candidates = set()
         multi = None
         if MULTI:
             try:
@@ -1120,6 +1145,11 @@ def main():
                     log("cond-error", patch.stem, repr(e))
                 if pending:
                     chosen = chk.resolve(patch.stem, text, sel, chosen, pending)
+                    if chk.state_clean:
+                        try:
+                            chosen = cond_trim(patch.stem, text, sel, chosen, [])
+                        except Exception as e:
+                            log("cond-error", patch.stem, repr(e))
             except Exception as e:                 # never crash, never guess low
                 log("fallback", patch.stem, repr(e)); chosen = set(sel.all)
             static_n = len(chosen)
@@ -1133,7 +1163,7 @@ def main():
             only = [x for x in os.environ.get("BR_DROP_ONLY", "").split(",") if x]
             chosen = {n for n in chosen if ms[n] < HEAVY_SECS * 1000
                       or (only and chk.id[n].rsplit("::", 1)[-1] not in only)}
-        print(json.dumps({"commit": patch.stem, "workers": pack(chosen, ms)}), flush=True)
+        print(json.dumps({"commit": patch.stem, "workers": pack(chosen, ms, candidates)}), flush=True)
         log(patch.stem, static_n, len(chosen))
     if chk.v is not None:
         chk.v.close()
