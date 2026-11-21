@@ -1,0 +1,763 @@
+"""Blast Radius selector.
+
+For every patch, pick the tests that the change can reach, using maps built once from the
+pinned sqlglot commit (see build_map.py): per-test line coverage, files each test opens,
+which tests use which classes, and static name references. Nothing here is keyed on a
+specific patch or on a kind of edit; every rule is "which tests can observe this line".
+"""
+import ast
+import json
+import os
+import pickle
+import re
+import sys
+import time
+import zlib
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+DATA = Path(os.environ.get("BR_DATA", "/data"))
+SG = Path(os.environ.get("BR_SG", "/sqlglot"))
+MAP = os.environ.get("BR_MAP", str(Path(__file__).with_name("map.pkl.z")))
+FAMILY_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
+CORE_BASENAMES = ("dialect.py", "__init__.py")
+GLOBAL_CONFIG = ("pyproject.toml", "setup.cfg", "setup.py", "pytest.ini", "tox.ini", "conftest.py")
+
+
+T0 = time.time()
+
+
+def log(*a):
+    print(*a, file=sys.stderr)
+
+
+# ---------------------------------------------------------------- patch parsing
+class FilePatch:
+    def __init__(self):
+        self.old = self.new = None
+        self.binary = False
+        self.hunks = []          # (old_start, [(tag, text)])
+
+    @property
+    def removed(self):
+        out = []
+        for start, body in self.hunks:
+            o = start
+            for tag, _ in body:
+                if tag == "-":
+                    out.append(o)
+                if tag != "+":
+                    o += 1
+        return out
+
+    @property
+    def insert_points(self):
+        """Old line numbers in front of which pure additions land."""
+        out = []
+        for start, body in self.hunks:
+            o = start
+            prev = " "
+            for tag, _ in body:
+                if tag == "+" and prev != "-" :
+                    out.append(o)
+                if tag != "+":
+                    o += 1
+                if tag != "+" or prev != "-":
+                    prev = tag
+        return out
+
+    def added_text(self):
+        return [t for _, b in self.hunks for tag, t in b if tag == "+"]
+
+    def removed_text(self):
+        return [t for _, b in self.hunks for tag, t in b if tag == "-"]
+
+    def apply(self, old_src):
+        old = old_src.split("\n")
+        out, pos = [], 0
+        for start, body in self.hunks:
+            i = max(start - 1, 0)
+            out.extend(old[pos:i])
+            pos = i
+            for tag, text in body:
+                if tag == " ":
+                    out.append(old[pos] if pos < len(old) else text); pos += 1
+                elif tag == "-":
+                    pos += 1
+                else:
+                    out.append(text)
+        out.extend(old[pos:])
+        return "\n".join(out)
+
+
+def parse_patch(text):
+    files, cur, body = [], None, None
+    for line in text.split("\n"):
+        if line.startswith("diff --git"):
+            cur = FilePatch(); files.append(cur); body = None
+            m = re.match(r"diff --git a/(.+) b/(.+)$", line)
+            if m:                                 # kept when there are no ---/+++ lines (binary patches)
+                cur.old, cur.new = m.group(1), m.group(2)
+        elif cur is not None and line.startswith("new file mode"):
+            cur.old = None
+        elif cur is not None and line.startswith("deleted file mode"):
+            cur.new = None
+        elif cur is not None and (line.startswith("GIT binary patch") or line.startswith("Binary files")):
+            cur.binary = True
+        elif cur is None:
+            continue
+        elif line.startswith("--- ") and body is None:
+            p = line[4:].strip(); cur.old = None if p == "/dev/null" else p[2:] if p[:2] in ("a/", "b/") else p
+        elif line.startswith("+++ ") and body is None:
+            p = line[4:].strip(); cur.new = None if p == "/dev/null" else p[2:] if p[:2] in ("a/", "b/") else p
+        elif line.startswith("rename from "):
+            cur.old = line[12:].strip()
+        elif line.startswith("rename to "):
+            cur.new = line[10:].strip()
+        elif line.startswith("@@"):
+            start = int(line.split("-", 1)[1].split(",")[0].split(" ")[0])
+            body = []; cur.hunks.append((start, body))
+        elif body is not None and line[:1] in (" ", "-", "+"):
+            body.append((line[0], line[1:]))
+        elif body is not None and line == "":
+            body.append((" ", ""))
+    for f in files:
+        for _, b in f.hunks:
+            while b and b[-1] == (" ", ""):
+                b.pop()
+    return files
+
+
+# ---------------------------------------------------------------- selector
+class Selector:
+    def __init__(self, m, tests):
+        self.m = m
+        num = {t["id"]: t["number"] for t in tests}
+        self.all = set(num.values())
+        self.tr = [num.get(i) for i in m["ids"]]            # map index -> test number (None if absent)
+        self.by_file = {}
+        for t in tests:
+            self.by_file.setdefault(t["file"], set()).add(t["number"])
+        self.id_num = num
+        self.unknown = self.all - {n for n in self.tr if n is not None}
+        self.lines, self.imp = m["lines"], {f: set(v) for f, v in m["import_lines"].items()}
+        self.struct, self.refs, self.used = m["struct"], m["refs"], m["used"]
+        self.modfile = {v["module"]: f for f, v in m["struct"].items()}
+        self.texts, self.name_cache, self.pending = None, {}, []
+
+    def T(self, idxs):
+        return {self.tr[i] for i in idxs if self.tr[i] is not None}
+
+    def cov(self, f, lo, hi):
+        d = self.lines.get(f, {})
+        out = set()
+        for l in range(lo, hi + 1):
+            if l in d:
+                out.update(d[l])
+        return self.T(out)
+
+    def scope(self, f, line):
+        best = None
+        for s in self.struct[f]["scopes"]:
+            if s[0] <= line <= s[1] and (best is None or s[1] - s[0] <= best[1] - best[0]):
+                best = s
+        return best
+
+    def stmt(self, f, line):
+        best = None
+        for s in self.struct[f]["stmts"]:
+            if s[0] <= line <= s[1] and (best is None or s[1] - s[0] < best[1] - best[0]):
+                best = s
+        return best
+
+    # ---- fallbacks
+    def fallback(self, f):
+        base = os.path.basename(f)
+        if f.startswith(FAMILY_DIRS) and base not in CORE_BASENAMES:
+            out = set()
+            for d in FAMILY_DIRS:
+                g = d + base
+                if g in self.struct:
+                    out |= self.cov(g, 1, self.struct[g]["nlines"])
+                    for s in self.struct[g]["scopes"]:
+                        if s[2] == "class":
+                            out |= self.T(self.used.get(s[3], ()))
+            return out | self.unknown
+        return set(self.all)
+
+    def users(self, owner, f):
+        if owner is not None and owner in self.used:
+            return self.T(self.used[owner])
+        if owner is not None and f.startswith("sqlglot/expressions/"):
+            return set()                       # expression class no test ever instantiates
+        return self.fallback(f)
+
+    def by_names(self, names, owner, f):
+        out = set()
+        for nm in names:
+            derived, rt = False, set()
+            for rf, rl in self.refs.get(nm, ()):
+                sc, st = self.scope(rf, rl), self.stmt(rf, rl)
+                lo, hi = (st[0], st[1]) if st else (rl, rl)
+                if sc is not None and sc[2] in ("func", "lambda"):
+                    rt |= self.cov(rf, lo, hi)
+                    if sc[2] == "func" and any(l in self.imp.get(rf, ()) for l in range(lo, hi + 1)):
+                        derived = True         # read while importing: value is baked into other state
+                elif st is not None and nm in st[2]:
+                    continue                    # the definition itself, or a same-name extension in a subclass
+                else:
+                    derived = True              # read at class/module level under another name
+            users = self.users(owner, f)
+            out |= users if derived else (rt & users)
+        return out
+
+    # ---- one changed line of a sqlglot source file
+    # returns (tests that can reach the line at run time, static answer for import-time effects or None)
+    def code_line(self, f, line):
+        sc, st = self.scope(f, line), self.stmt(f, line)
+        if sc is not None and sc[2] in ("func", "lambda"):
+            if sc[2] == "lambda":
+                return self.cov(f, sc[0], sc[1]), None
+            if line < sc[4] or st is None or not (sc[0] <= st[0] and st[1] <= sc[1]):
+                lo, hi = sc[4], sc[1]          # signature, decorator or a line between statements
+            else:
+                lo, hi = st[0], st[1]
+            out = self.cov(f, lo, hi)
+            if line < sc[4] or any(l in self.imp.get(f, ()) for l in range(lo, hi + 1)):
+                return out, ("import", self.fallback(f))   # this code (or its signature) takes effect while importing
+            return out, None
+        owner = sc[3] if sc is not None else None
+        if st is not None and st[2]:
+            return set(), ("level", self.by_names(st[2], owner, f))
+        return set(), ("level", self.users(owner, f) if owner else self.fallback(f))
+
+    def source_file(self, fp):
+        f = fp.old
+        if fp.binary:
+            return set(self.all)
+        if fp.old is None:
+            # a new module: harmless unless importing the package now fails or something enumerates modules
+            self.pending.append(("module", set(self.all)))
+            return self.mentions_any(("pkgutil", "walk_packages", "iter_modules", "listdir", "glob("))
+        if fp.new is None or fp.old != fp.new or f not in self.struct:
+            # a module went away (deleted or renamed): everything that uses it, plus whatever the import-state diff shows
+            self.pending.append(("module", set(self.all)))
+            out = set()
+            if f in self.struct:
+                out |= self.cov(f, 1, self.struct[f]["nlines"])
+                for sc in self.struct[f]["scopes"]:
+                    if sc[2] == "class":
+                        out |= self.T(self.used.get(sc[3], ()))
+                out |= self.mentions_any((self.struct[f]["module"], os.path.basename(f)[:-3]))
+            else:
+                out = set(self.all)
+            return out
+        old_src = (SG / f).read_text(encoding="utf-8")
+        new_src = fp.apply(old_src)
+        try:
+            new_tree = ast.parse(new_src)
+        except SyntaxError:
+            # the module can no longer be imported: its users for sure, and the import check decides the rest
+            self.pending.append(("module", set(self.all)))
+            out = self.cov(f, 1, self.struct[f]["nlines"]) | self.mentions_any((self.struct[f]["module"], os.path.basename(f)[:-3]))
+            for sc in self.struct[f]["scopes"]:
+                if sc[2] == "class":
+                    out |= self.T(self.used.get(sc[3], ()))
+            return out
+        squash = lambda lines: re.sub(r"\s+", "", "".join(l.split("#")[0] for l in lines))
+        if squash(fp.removed_text()) == squash(fp.added_text()):
+            # only comments, blank lines or layout differ on the face of it: confirm on the syntax trees
+            if ast.dump(ast.parse(old_src)) == ast.dump(new_tree):
+                return set()                    # identical program
+        out = set()
+        nlines = self.struct[f]["nlines"]
+        targets = set(fp.removed)
+        for p in fp.insert_points:
+            targets.update(x for x in (p - 1, p) if 1 <= x <= nlines)
+        for line in targets:
+            run, static = self.code_line(f, line)
+            out |= run
+            if static is not None:
+                self.pending.append(static)
+        return out
+
+    def test_file(self, fp):
+        f = fp.old or fp.new
+        todo, seen = [f], {f}
+        while todo:                                  # test modules that import this one, transitively
+            x = todo.pop()
+            for g, deps in self.m["test_imports"].items():
+                if x in deps and g not in seen:
+                    seen.add(g); todo.append(g)
+        whole = set()
+        for g in seen:
+            whole |= self.by_file.get(g, set())
+        if fp.old is None:
+            # a new module under tests/: its own tests are not numbered; a conftest or package file affects everyone
+            return set(self.all) if os.path.basename(f) in ("conftest.py", "__init__.py") else set()
+        if fp.new is None or fp.old != fp.new or f not in self.m["test_spans"] or fp.binary:
+            return whole
+        old_src = (SG / f).read_text(encoding="utf-8")
+        try:
+            old_tree, new_tree = ast.parse(old_src), ast.parse(fp.apply(old_src))
+        except SyntaxError:
+            return whole
+        if ast.dump(old_tree) == ast.dump(new_tree):
+            return set()
+
+        def shape(tree):
+            rest, classes = [], {}
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef):
+                    methods, other = {}, [ast.dump(b) for b in node.bases] + [ast.dump(d) for d in node.decorator_list]
+                    for x in node.body:
+                        if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            methods[x.name] = ast.dump(x)
+                        else:
+                            other.append(ast.dump(x))
+                    classes[node.name] = (methods, other)
+                else:
+                    rest.append(ast.dump(node))
+            return rest, classes
+
+        (rest_a, cls_a), (rest_b, cls_b) = shape(old_tree), shape(new_tree)
+        if rest_a != rest_b or set(cls_a) != set(cls_b) or len(seen) > 1:
+            return whole                             # module-level change, or other test modules build on this one
+        out = set()
+        for cname in cls_a:
+            (ma, oa), (mb, ob) = cls_a[cname], cls_b[cname]
+            if oa != ob:
+                return whole                         # class-level statements, bases or decorators changed
+            changed = [n for n in set(ma) | set(mb) if ma.get(n) != mb.get(n)]
+            if not changed:
+                continue
+            if any(cname in o for k, (_, other) in cls_a.items() if k != cname for o in other):
+                return whole                         # another class in the file derives from this one
+            for name in changed:
+                if not name.startswith("test"):
+                    return whole                     # a helper or setUp/tearDown: every test here may depend on it
+                tid = f"{f}::{cname}::{name}"
+                if tid in self.id_num:               # a brand new test method has no number, so nothing to run
+                    out.add(self.id_num[tid])
+        return out
+
+    # ---- tests that read a piece of import-time state (items come from fingerprint.py)
+    def name_tests(self, name):
+        if self.texts is None:
+            self.texts = {f: (SG / f).read_text(encoding="utf-8").split("\n") for f in self.struct if f.startswith("sqlglot/")}
+        if name not in self.name_cache:
+            pat, out = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])"), set()
+            for f, lines in self.texts.items():
+                for i, l in enumerate(lines, 1):
+                    if name in l and pat.search(l):
+                        st = self.stmt(f, i)
+                        out |= self.cov(f, st[0], st[1]) if st else self.cov(f, i, i)
+            self.name_cache[name] = out
+        return self.name_cache[name]
+
+    def readers(self, items, gone=()):
+        out = set()
+        for it in items:
+            mod, rest = it.split(":", 1)
+            if mod in gone:
+                continue                         # the module itself was removed; its users are selected directly
+            f = self.modfile.get(mod)
+            if f is None:
+                continue                         # state of a module that is new in this patch: nothing reads it yet
+            key = None
+            if rest.endswith("]") and "[" in rest:
+                i = rest.index("["); rest, key = rest[:i], rest[i + 1:-1]
+            binding = mod + ":" + rest
+            if key is not None and binding in self.m["aliases"]:
+                ku = self.m["keyuse"].get(self.m["aliases"][binding], {})
+                out |= self.T(ku.get(key, ())) | self.T(ku.get("*", ()))
+                continue
+            scopes = {sc[3]: sc for sc in self.struct[f]["scopes"]}
+            if binding in scopes and scopes[binding][2] == "class":
+                out |= self.users(binding, f)          # the class itself changed shape
+                continue
+            if binding in scopes:                      # a function whose defaults or closure changed
+                out |= self.cov(f, scopes[binding][0], scopes[binding][1])
+            cls, _, name = rest.rpartition(".")
+            if name == "<members>":
+                out |= self.fallback(f)
+                continue
+            rt = self.name_tests(name)
+            owner = mod + ":" + cls
+            out |= (rt & self.T(self.used[owner])) if cls and owner in self.used else rt
+        return out
+
+    def select(self, text):
+        """Returns (tests reachable at run time, [static answers for import-time effects])."""
+        self.pending = []
+        return self._select(text), self.pending
+
+    def _select(self, text):
+        out = set()
+        for fp in parse_patch(text):
+            f = fp.old or fp.new
+            if f is None:
+                continue
+            if os.path.basename(f) in ("conftest.py", "pytest.ini", "tox.ini"):
+                out |= self.all
+            elif f in GLOBAL_CONFIG:
+                # packaging/config files: they matter to every test only if they configure pytest
+                try:
+                    new_text = fp.apply((SG / f).read_text(encoding="utf-8")) if fp.old and fp.new and not fp.binary else None
+                except OSError:
+                    new_text = None
+                old_text = (SG / f).read_text(encoding="utf-8") if (SG / f).exists() else ""
+                if new_text is None or "pytest" in new_text.lower() or "pytest" in old_text.lower():
+                    out |= self.all
+                else:
+                    out |= self.T(self.m["opened"].get(f, ())) | self.mentions_any((f, f.rsplit(".", 1)[0]) if f != "setup.py" else (f,))
+            elif f.startswith("sqlglot/") and f.endswith(".py"):
+                out |= self.source_file(fp)
+            elif f.startswith("tests/") and f.endswith(".py"):
+                out |= self.test_file(fp)
+            else:
+                if f.endswith(".sql") and fp.old == fp.new and (SG / f).exists():
+                    # tests/helpers.py drops blank lines and lines starting with "--" before using a fixture
+                    keep = lambda s: [l for l in s.splitlines() if l and not l.startswith("--")]
+                    old_src = (SG / f).read_text(encoding="utf-8")
+                    if keep(old_src) == keep(fp.apply(old_src)):
+                        continue
+                got = self.T(self.m["opened"].get(f, ()))
+                if not got and f.endswith(".py"):
+                    got = self.mentions(f)
+                if fp.binary and not got and f.startswith("tests/"):
+                    got = set(self.all)
+                out |= got
+        return out
+
+    def mentions_any(self, keys):
+        out = set()
+        for tf in self.m["test_spans"]:
+            try:
+                text = (SG / tf).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if any(k in text for k in keys):
+                out |= self.by_file.get(tf, set())
+        return out
+
+    def mentions(self, f):
+        """A Python file outside sqlglot/ and tests/ (build scripts and the like): tests whose module mentions it."""
+        keys = {f.split("/")[0], os.path.basename(f)[:-3]} - {"setup", "__init__", ""}
+        out = set()
+        for tf in self.m["test_spans"]:
+            try:
+                text = (SG / tf).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if any(k in text for k in keys):
+                out |= self.by_file.get(tf, set())
+        return out
+
+
+def pack(nums, ms):
+    if not nums:
+        return []
+    order = sorted(nums, key=lambda n: -ms[n])
+    best = None
+    for k in range(1, 9):
+        loads, workers = [0] * k, [[] for _ in range(k)]
+        for n in order:
+            i = loads.index(min(loads)); workers[i].append(n); loads[i] += ms[n]
+        cost = max(loads) + 2000 * k
+        if best is None or cost < best[0]:
+            best = (cost, workers)
+    return [w for w in best[1] if w]
+
+
+PIN = os.environ.get("BR_PIN", str(Path(__file__).with_name("unstable.json")))   # state items whose value varies run to run
+STATE = os.environ.get("BR_STATE", "1") == "1"                    # import-state diff for import-time edits
+NARROW_IMPORT = os.environ.get("BR_NARROW_IMPORT", "0") == "1"    # when only dialect modules fail to import, select their users
+STATE_EMPTY_KEEPS_STATIC = os.environ.get("BR_STATE_EMPTY", "1") == "1"
+VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
+VERIFY_RATIO = float(os.environ.get("BR_VERIFY_RATIO", "0.45"))   # run for real only if est. CPU <= ratio * simulated cost
+VERIFY_RATIO_HEAVY = float(os.environ.get("BR_VERIFY_RATIO_HEAVY", "0.65"))
+HEAVY_SECS = 3.0
+SKIP_HEAVY = os.environ.get("BR_SKIP_HEAVY", "0") == "1"          # drop heavy tests when every other candidate passes
+SLOW_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
+EQUIV = os.environ.get("BR_EQUIV", "0") == "1"                    # side-by-side check of a swapped comparison operator
+EQUIV_CONST = os.environ.get("BR_EQUIV_CONST", "0") == "1"        # literal operand: do not vary that side in the probe
+EQUIV_BUDGET = float(os.environ.get("BR_EQUIV_BUDGET", "2.0"))    # CPU seconds of cheap candidates to observe
+EQUIV_MAX_TESTS = int(os.environ.get("BR_EQUIV_MAX_TESTS", "25"))
+EQUIV_MIN_RUNS = int(os.environ.get("BR_EQUIV_MIN_RUNS", "20"))
+EQUIV_MIN_TESTS = int(os.environ.get("BR_EQUIV_MIN_TESTS", "3"))
+PROXY = os.environ.get("BR_PROXY", "0") == "1"
+PROXY_SIM = float(os.environ.get("BR_PROXY_SIM", "0.6"))
+
+
+def cost_ms(nums, ms):
+    w = pack(nums, ms)
+    return max(sum(ms[n] for n in x) for x in w) + 2000 * len(w) if w else 0
+
+
+def _pure(node):
+    """An expression that can be evaluated a second time without side effects (no calls)."""
+    if isinstance(node, (ast.Name, ast.Constant)):
+        return True
+    if isinstance(node, ast.Attribute):
+        return _pure(node.value)
+    if isinstance(node, ast.Subscript):
+        return _pure(node.value) and _pure(node.slice)
+    if isinstance(node, ast.Tuple):
+        return all(_pure(e) for e in node.elts)
+    if isinstance(node, ast.UnaryOp):
+        return _pure(node.operand)
+    return False
+
+
+def compare_swap(old_src, new_src):
+    """If the only difference between two versions of a module is the operator of one two-operand comparison whose
+    operands are plain names/attributes/constants, describe it; otherwise None."""
+    try:
+        a, b = ast.parse(old_src), ast.parse(new_src)
+    except SyntaxError:
+        return None
+    found = []
+
+    def walk(x, y):
+        if len(found) > 1:
+            return
+        if type(x) is not type(y):
+            found.append(None); return
+        if isinstance(x, ast.Compare) and len(x.ops) == 1 and len(y.ops) == 1 and type(x.ops[0]) is not type(y.ops[0]) \
+                and ast.dump(x.left) == ast.dump(y.left) and ast.dump(x.comparators[0]) == ast.dump(y.comparators[0]):
+            found.append((x, y)); return
+        for (_, va), (_, vb) in zip(ast.iter_fields(x), ast.iter_fields(y)):
+            if isinstance(va, ast.AST) and isinstance(vb, ast.AST):
+                walk(va, vb)
+            elif isinstance(va, list) and isinstance(vb, list):
+                if len(va) != len(vb):
+                    found.append(None); return
+                for p, q in zip(va, vb):
+                    if isinstance(p, ast.AST) and isinstance(q, ast.AST):
+                        walk(p, q)
+                    elif p != q:
+                        found.append(None); return
+            elif va != vb:
+                found.append(None); return
+
+    walk(a, b)
+    if len(found) != 1 or found[0] is None:
+        return None
+    x, y = found[0]
+    if not (_pure(x.left) and _pure(x.comparators[0])):
+        return None
+    out = {"line": y.lineno, "left": ast.unparse(y.left), "right": ast.unparse(y.comparators[0]),
+           "old": type(x.ops[0]).__name__, "new": type(y.ops[0]).__name__}
+    if EQUIV_CONST and isinstance(y.comparators[0], ast.Constant):
+        out["const"] = "right"
+    elif EQUIV_CONST and isinstance(y.left, ast.Constant):
+        out["const"] = "left"
+    return out
+
+
+class Checker:
+    """Runs the cheap candidates for real against the patched source. Only ever removes tests
+    when every one of them is reported as passed; any doubt keeps the full static selection."""
+    def __init__(self, tests, ms):
+        self.ms, self.v = ms, None
+        self.id = {t["number"]: t["id"] for t in tests}
+        self.file = {t["number"]: t["file"] for t in tests}
+        self.cpu = 0.0
+        self.proxy, self.cpu_own, self.cpu_setup = {}, {}, {}
+        self.deadline = time.time() + 100
+
+    def start(self):
+        if self.v is None:
+            from verify import Verifier
+            self.v = Verifier(SG, os.environ.get("BR_TMP", "/tmp/br_wc"), PIN)
+        return self.v
+
+    def patched(self, text):
+        out = {}
+        for fp in parse_patch(text):
+            if fp.binary or (fp.old is not None and not (SG / fp.old).exists()):
+                return None
+            old_src = (SG / fp.old).read_text(encoding="utf-8") if fp.old else ""
+            if fp.old and fp.old != fp.new:
+                out[fp.old] = None               # deleted, or the old name of a rename
+            if fp.new:
+                out[fp.new] = fp.apply(old_src)
+        return out
+
+    def resolve(self, name, text, sel, chosen, pending):
+        """Edits that take effect while sqlglot is imported: import the patched package once and
+        see which pieces of import-time state actually changed, then select the tests that read them."""
+        static = set().union(*[p for _, p in pending])
+        patched = self.patched(text) if STATE else None
+        if patched is None or self.left() < 15:
+            # cannot look at the import-time effect: only the whole suite is safe
+            return set(sel.all) if STATE else chosen | static
+        first = self.v is None or not self.v.baseline
+        r = self.start().state(patched, limit=min(25.0, self.left() - 5))
+        self.cpu += self.v.last.get("cpu", 0) + (self.v.base_cpu if first else 0)
+        if r is None or r["n"] > 300:
+            log("state", name, "import failed" if r is None else "many items", "-> all tests")
+            return set(sel.all)
+        if r.get("failed_modules"):
+            # some modules no longer import. If they are all dialect-family modules (loaded lazily), only the tests
+            # that use those dialects are affected; a core module failing takes everything with it.
+            files = [sel.modfile.get(m) for m in r["failed_modules"]]
+            if not NARROW_IMPORT or any(f is None or not f.startswith(FAMILY_DIRS) or os.path.basename(f) in CORE_BASENAMES for f in files):
+                log("state", name, "modules fail to import", r["failed_modules"][:3], "-> all tests")
+                return set(sel.all)
+            for f in files:
+                chosen = chosen | sel.fallback(f) | sel.mentions_any((os.path.basename(f)[:-3],))
+            log("state", name, "dialect modules fail to import", r["failed_modules"][:4], "->", len(chosen))
+        if r["n"] == 0:
+            # nothing observable changed at import time. A class/module-level edit that leaves no trace is
+            # unusual, so those keep their static answer; import-time function lines add nothing.
+            extra = set().union(*[p for mode, p in pending if mode == "level"]) if STATE_EMPTY_KEEPS_STATIC else set()
+            log("state", name, "no change", len(extra))
+            return chosen | extra
+        gone = {sel.struct[fp.old]["module"] for fp in parse_patch(text)
+                if fp.old in sel.struct and (fp.new is None or fp.new != fp.old)}
+        got = sel.readers(r["changed"], gone)
+        log("state", name, r["n"], "items", r["changed"][:3], "->", len(got))
+        return chosen | got
+
+    def estimate(self, nums):
+        """Expected CPU seconds to run these tests for real (measured per test when the map has it)."""
+        c, classes = 0.19, set()
+        for n in nums:
+            if n in self.cpu_own:
+                c += self.cpu_own[n]
+                classes.add(self.id[n].rsplit("::", 1)[0])
+            else:
+                c += self.ms[n] / 1000 * (2.0 if self.file[n] in SLOW_FILES else 1.0)
+        return c + sum(self.cpu_setup.get(k, 0.0) for k in classes)
+
+    def left(self):
+        return self.deadline - time.time()
+
+    def check(self, name, text, chosen, all_count):
+        if not VERIFY or not chosen or len(chosen) > 0.5 * all_count or self.left() < 20:
+            return chosen
+        if any(fp.old is None or fp.new is None or fp.old != fp.new for fp in parse_patch(text)):
+            return chosen
+        patched = self.patched(text)
+        if patched is None:
+            return chosen
+        if not all(f.endswith(".py") for f in patched):
+            return chosen          # a data file some candidate reads changed: running it would almost surely just confirm that
+        heavy = {n for n in chosen if self.ms[n] >= HEAVY_SECS * 1000}
+        # A patch that only swaps the operator of one comparison: run some of the cheapest candidates and apply the
+        # old and the new operator side by side to the values that actually reach that line (and to nearby inputs).
+        # If the two never disagree over enough executions, the change is not observable and nothing needs to run.
+        if EQUIV and len(patched) == 1 and self.left() > 20:
+            (rel, new_src), = patched.items()
+            hunk = "\n".join(t for fp in parse_patch(text) for t in fp.added_text() + fp.removed_text())
+            sw = compare_swap((SG / rel).read_text(encoding="utf-8"), new_src) if re.search(r"==|!=|<|>|\bis\b|\bin\b", hunk) else None
+            if sw:
+                sw["file"] = rel
+                # cheapest candidates first, at most 8 per test class so the operands seen come from several places
+                cost = lambda n: self.cpu_own.get(n, self.ms[n] / 1000)
+                pick, used, per_cls = [], 0.19, {}
+                for n in sorted(chosen - heavy, key=cost):
+                    k = self.id[n].rsplit("::", 1)[0]
+                    if per_cls.get(k, 0) >= 8:
+                        continue
+                    c = cost(n) + 0.05                      # plus per-test runner overhead
+                    if pick and (used + c > EQUIV_BUDGET or len(pick) >= EQUIV_MAX_TESTS):
+                        break
+                    pick.append(n); used += c; per_cls[k] = per_cls.get(k, 0) + 1
+                if pick:
+                    r = self.start().run(patched, [self.id[n] for n in pick], stop=True, limit=min(max(10.0, 6 * used), self.left() - 5), probe=sw)
+                    self.cpu += r.get("cpu", 0)
+                    pr = r.get("probe") or {}
+                    passed = r.get("rc") == 0 and not r.get("failed") and not r.get("collect") and not r.get("crash") \
+                        and set(r.get("passed", ())) >= {self.id[n] for n in pick}
+                    log("equiv", name, sw["old"], "->", sw["new"], "tests", len(pick), "cpu", r.get("cpu"), "probe", pr, "passed", passed)
+                    if not passed:
+                        return chosen
+                    if pr.get("agree") and pr.get("n", 0) >= EQUIV_MIN_RUNS and pr.get("tests", 0) >= min(EQUIV_MIN_TESTS, len(chosen - heavy)):
+                        return set()
+                    chosen = chosen - set(pick)          # these passed for real; carry on with the rest
+        # An expensive test with a cheaper "proxy" (another class's test that reads the same fixture and executes
+        # nearly the same lines): if the proxy also reaches this change and passes for real, drop the expensive one.
+        if PROXY and heavy:
+            pairs = {}
+            for hv in heavy:
+                for sim, p in self.proxy.get(hv, ()):
+                    if sim >= PROXY_SIM and p in chosen and p not in heavy and self.ms[p] < self.ms[hv]:
+                        pairs[hv] = p
+                        break
+            if pairs:
+                px = sorted(set(pairs.values()), key=lambda n: self.ms[n])
+                est = self.estimate(px)
+                gain = (cost_ms(chosen, self.ms) - cost_ms(chosen - set(pairs), self.ms)) / 1000
+                if est <= 0.6 * gain and self.left() > 20:
+                    r = self.start().run(patched, [self.id[n] for n in px], stop=True, limit=min(max(15.0, 6 * est), self.left() - 5))
+                    self.cpu += r.get("cpu", 0)
+                    clean = r.get("rc") in (0, 1) and not r.get("collect") and not r.get("crash")
+                    passed = {n for n in px if clean and self.id[n] in set(r.get("passed", ())) and self.id[n] not in set(r.get("failed", ()))}
+                    drop = {hv for hv, p in pairs.items() if p in passed}
+                    log("proxy", name, [self.id[n].split("::")[-1] for n in px], "cpu", r.get("cpu"), "dropped", len(drop))
+                    chosen = chosen - drop - passed
+                    heavy = heavy - drop
+                    if len(passed) < len(px):
+                        return chosen                 # a proxy failed: keep everything else as selected
+        rest = sorted(chosen - heavy, key=lambda n: self.ms[n])
+        if not rest:
+            return chosen
+        est = self.estimate(rest)
+        gain = cost_ms(chosen, self.ms) / 1000 if (SKIP_HEAVY or not heavy) else (cost_ms(chosen, self.ms) - cost_ms(heavy, self.ms)) / 1000
+        ratio = VERIFY_RATIO_HEAVY if (SKIP_HEAVY and heavy) else VERIFY_RATIO
+        if est > ratio * gain:
+            log("verify", name, "skipped: est", round(est, 2), "gain", round(gain, 2))
+            return chosen
+        r = self.start().run(patched, [self.id[n] for n in rest], stop=True, limit=min(max(10.0, 6 * est), self.left() - 5))
+        self.cpu += r.get("cpu", 0)
+        ok = r.get("rc") == 0 and not r.get("failed") and not r.get("collect") and not r.get("crash") \
+            and set(r.get("passed", ())) >= {self.id[n] for n in rest}
+        log("verify", name, "tests", len(rest), "est", round(est, 2), "cpu", r.get("cpu"), "all-pass" if ok else "kept")
+        if not ok:
+            return chosen
+        return set() if SKIP_HEAVY else heavy
+
+
+def main():
+    tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
+    with open(MAP, "rb") as fh:
+        raw = fh.read()
+    sel = Selector(pickle.loads(zlib.decompress(raw) if MAP.endswith(".z") else raw), tests)
+    chk = Checker(tests, ms)
+    chk.proxy = {sel.tr[t]: [(sim, sel.tr[o]) for sim, o in v if sel.tr[o] is not None]
+                 for t, v in sel.m.get("proxy", {}).items() if sel.tr[t] is not None}
+    chk.cpu_own = {sel.tr[t]: c for t, c in sel.m.get("cpu_own", {}).items() if sel.tr[t] is not None}
+    chk.cpu_setup = sel.m.get("cpu_setup", {})
+    patches = sorted((DATA / "commits").glob("*.patch"))
+    if os.environ.get("BR_ONLY"):               # development aid: restrict to listed commit ids
+        only = set(open(os.environ["BR_ONLY"]).read().split())
+        patches = [p for p in patches if p.stem in only]
+    # the batch limit is 3 minutes (4.5 in the larger final); stop running things for real well before it
+    chk.deadline = T0 + float(os.environ.get("BR_BUDGET", "110" if len(patches) <= 45 else "170"))
+    for patch in patches:
+        text = patch.read_text(encoding="utf-8", errors="replace")
+        try:
+            chosen, pending = sel.select(text)
+            if pending:
+                chosen = chk.resolve(patch.stem, text, sel, chosen, pending)
+        except Exception as e:                 # never crash, never guess low
+            log("fallback", patch.stem, repr(e)); chosen = set(sel.all)
+        static_n = len(chosen)
+        try:
+            chosen = chk.check(patch.stem, text, chosen, len(sel.all))
+        except Exception as e:
+            log("verify-error", patch.stem, repr(e))
+        print(json.dumps({"commit": patch.stem, "workers": pack(chosen, ms)}), flush=True)
+        log(patch.stem, static_n, len(chosen))
+    if chk.v is not None:
+        chk.v.close()
+    log("verify cpu", round(chk.cpu, 2))
+
+
+if __name__ == "__main__":
+    main()
