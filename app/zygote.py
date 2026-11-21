@@ -29,6 +29,12 @@ for mod in ("duckdb", "pandas", "numpy"):
     except Exception:
         pass
 
+try:
+    sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
+    import duckmemo                      # answers DuckDB queries already seen at the pinned commit from a memo
+except Exception:
+    duckmemo = None
+
 
 class InProcessPool:
     """Runs pool work in this process (with the same pickle round trip) to avoid spawning workers."""
@@ -53,12 +59,15 @@ cfp.ProcessPoolExecutor = InProcessPool
 
 
 class Plug:
-    def __init__(self, wfd=None, stop=False):
+    def __init__(self, wfd=None, stop=False, max_sub=0):
+        self.max_sub = max_sub
         self.failed, self.passed, self.collect = set(), set(), set()
+        self.sub, self.whole = [], set()
         self.wfd, self.stop = wfd, stop
     def quit(self):
         # the caller only needs to know that something failed: answer now instead of finishing the test
-        out = {"rc": 1, "failed": sorted(self.failed), "collect": sorted(self.collect), "passed": [], "early": True}
+        out = {"rc": 1, "failed": sorted(self.failed), "collect": sorted(self.collect), "passed": [], "early": True,
+               "sub": self.sub, "whole": sorted(self.whole)}
         os.write(self.wfd, json.dumps(out).encode())
         os._exit(0)
     def pytest_runtest_logstart(self, nodeid, location):
@@ -66,6 +75,13 @@ class Plug:
     def pytest_runtest_logreport(self, report):
         if report.failed:
             self.failed.add(report.nodeid)
+            msg = getattr(getattr(report, "context", None), "msg", None)
+            if msg is not None:
+                self.sub.append([report.nodeid, str(msg)[:200]])     # which subtest (fixture record) failed
+                if self.max_sub and len(self.sub) > self.max_sub:
+                    self.quit()                                       # too many to be worth narrowing down
+            elif getattr(report, "when", "call") == "call":
+                self.whole.add(report.nodeid)                        # the test itself failed outside any subtest
             if self.stop:
                 self.quit()
         elif report.when == "call" and report.passed and type(report).__name__ == "TestReport":
@@ -198,7 +214,20 @@ def install_slice(spec):
         setattr(H, fname, wrapped)
 
 
+def _fast_multiline(self, first, second, msg=None):
+    """Same verdict as unittest's assertMultiLineEqual, without building the line-by-line diff text."""
+    self.assertIsInstance(first, str, "First argument is not a string")
+    self.assertIsInstance(second, str, "Second argument is not a string")
+    if first != second:
+        self.fail(msg or "strings differ")
+
+
+unittest.TestCase.assertMultiLineEqual = _fast_multiline
+
+
 def child(req, wfd):
+    if duckmemo is not None and not req.get("duck", True):
+        duckmemo.ON = False
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1); os.dup2(devnull, 2)
     if req.get("op") in ("state", "baseline"):
@@ -211,7 +240,7 @@ def child(req, wfd):
         except BaseException:           # helpers cannot be imported: report as a crash, the caller keeps everything
             os.write(wfd, json.dumps({"rc": -1, "failed": [], "collect": [], "passed": [], "crash": True}).encode())
             os._exit(0)
-    plug = Plug(wfd, bool(req.get("stop", True)))
+    plug = Plug(wfd, bool(req.get("stop", True)), int(req.get("max_sub", 0)))
     args = list(req["ids"]) + ["-p", "no:cacheprovider", "-q", "--assert=plain"]
     if req.get("stop", True):
         args.append("-x")
@@ -222,7 +251,7 @@ def child(req, wfd):
     except BaseException as e:      # noqa
         rc = 99
     out = {"rc": rc, "failed": sorted(plug.failed), "collect": sorted(plug.collect),
-           "passed": sorted(plug.passed - plug.failed),
+           "passed": sorted(plug.passed - plug.failed), "sub": plug.sub, "whole": sorted(plug.whole),
            "probe": {"n": PROBE["n"], "agree": PROBE["agree"], "tests": len(PROBE["tests"] - {None})}}
     os.write(wfd, json.dumps(out).encode())
     os._exit(0)

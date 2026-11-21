@@ -1,0 +1,3 @@
+{"tests/test_executor.py::TestExecutor::test_execute_tpch": 0.06,
+ "tests/test_executor.py::TestExecutor::test_optimized_tpch": 0.1,
+ "tests/test_executor.py::TestExecutor::test_execute_tpcds": 10.6}

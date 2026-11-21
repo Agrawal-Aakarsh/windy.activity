@@ -500,6 +500,18 @@ EQUIV_MIN_TESTS = int(os.environ.get("BR_EQUIV_MIN_TESTS", "3"))
 SLICE = os.environ.get("BR_SLICE", "1") == "1"                    # run fixture-driven proxies only on the records that reach the change
 FIXSLICE = os.environ.get("BR_FIXSLICE", "0") == "1"              # fixture-only patches: run candidates on the changed records only
 DROP_HEAVY = os.environ.get("BR_DROP_HEAVY", "0") == "1"          # diagnostic, see main()
+TASTE = os.environ.get("BR_TASTE", "1") == "1"                    # sample a few records of a proxy before running all of it
+TASTE_N = int(os.environ.get("BR_TASTE_N", "10"))
+TASTE_MIN = int(os.environ.get("BR_TASTE_MIN", "30"))
+TASTE_STOP = int(os.environ.get("BR_TASTE_STOP", "3"))
+SELF = os.environ.get("BR_SELF", "0") == "1"                      # run a record-looping heavy test on the records that reach the change
+SELF_RATIO = float(os.environ.get("BR_SELF_RATIO", "0.5"))
+SELF_FIRST = int(os.environ.get("BR_SELF_FIRST", "6"))
+HEAVYRUN = os.environ.get("BR_HEAVYRUN", "0") == "1"              # run expensive tests for real when that is cheap
+HEAVYRUN_RATIO = float(os.environ.get("BR_HEAVYRUN_RATIO", "0.5"))
+REFINE_RATIO = float(os.environ.get("BR_REFINE_RATIO", "0.6"))
+REFINE_MAX = int(os.environ.get("BR_REFINE_MAX", "26"))           # more changed records than this: keep the heavy test
+REFINE = os.environ.get("BR_REFINE", "0") == "1"                  # proxy failed: run the heavy test on the changed records only
 PROXY = os.environ.get("BR_PROXY", "0") == "1"
 PROXY_SIM = float(os.environ.get("BR_PROXY_SIM", "0.6"))
 
@@ -635,6 +647,75 @@ class Checker:
         log("state", name, r["n"], "items", r["changed"][:3], "->", len(got))
         return chosen | got
 
+    def failed_records(self, sel, proxy, result, spec):
+        """(fixture file, record indexes) for the proxy's failing subtests, or None when that cannot be told."""
+        if self.id[proxy] in set(result.get("whole", ())):
+            return None                       # the proxy failed outside its per-record subtests
+        recmap = sel.m.get("rec", {}).get(sel.rev.get(proxy)) or {}
+        if len(recmap) != 1:
+            return None
+        (fx, info), = recmap.items()
+        ran = (spec or {}).get("files", {}).get(fx)      # records the proxy was run on, when it was sliced
+        idxs = set()
+        for nodeid, msg in result.get("sub", ()):
+            if nodeid != self.id[proxy]:
+                continue
+            m = re.match(r"(?:\(execute\) )?(\d+), ", msg)   # the tests title a record "<position>, <sql>"
+            if not m:
+                return None
+            pos = int(m.group(1)) - 1
+            if ran is not None:
+                if pos >= len(ran):
+                    return None
+                pos = ran[pos]
+            if pos >= info["n"]:
+                return None
+            idxs.add(pos)
+        if not idxs and self.id[proxy] in set(result.get("failed", ())):
+            return None
+        return fx, sorted(idxs)
+
+    def self_slice(self, sel, test):
+        """(fixture, record indexes that reach the changed lines, per-record CPU) for a record-looping test, or None."""
+        if sel is None or not sel.line_only or not sel.touched:
+            return None
+        t = sel.rev.get(test)
+        recmap = sel.m.get("selfrec", {}).get(t)
+        if not recmap or len(recmap) != 1:
+            return None
+        (fx, info), = recmap.items()
+        mask, seen = 0, False
+        for f, lo, hi in sel.touched:
+            static = sel.m["lines"].get(f, {})
+            d = info["lines"].get(f, {})
+            for l in range(lo, hi + 1):
+                if t in static.get(l, ()):
+                    if not d.get(l):
+                        return None          # the test runs this line, but not inside any single record: no slicing
+                    mask |= d[l]; seen = True
+                elif d.get(l):
+                    mask |= d[l]; seen = True
+        if not seen:
+            return None
+        return fx, [i for i in range(info["n"]) if mask >> i & 1], info["cpu"]
+
+    def taste_spec(self, sel, tests, spec):
+        """(sample slice, slice for the remaining records) for a first quick look, or (None, None)."""
+        first, rest = {}, {}
+        for n in tests:
+            recmap = sel.m.get("rec", {}).get(sel.rev.get(n)) or {}
+            if len(recmap) != 1:
+                return None, None
+            (fx, info), = recmap.items()
+            recs = list((spec or {}).get("files", {}).get(fx, range(info["n"])))
+            if len(recs) < TASTE_MIN or fx in first:
+                return None, None
+            step = len(recs) / TASTE_N
+            pick = sorted({recs[int(i * step + step / 2)] for i in range(TASTE_N)})
+            first[fx] = pick
+            rest[fx] = [i for i in recs if i not in set(pick)]
+        return ({"files": first}, {"files": rest}) if first else (None, None)
+
     def slice_for(self, sel, tests):
         """Fixture records these tests need to run to exercise the changed lines. Returns (slice spec or None, fraction)."""
         if not SLICE or sel is None or not sel.line_only or not sel.touched:
@@ -676,6 +757,44 @@ class Checker:
         return self.deadline - time.time()
 
     def check(self, name, text, chosen, all_count, sel=None):
+        chosen = self._check(name, text, chosen, all_count, sel)
+        if HEAVYRUN and VERIFY and chosen:
+            try:
+                chosen = self.heavy_run(name, text, chosen)
+            except Exception as e:
+                log("heavy-run", name, "error", repr(e))
+        return chosen
+
+    def heavy_run(self, name, text, chosen):
+        """Expensive tests that are cheap to run for real here (DuckDB answers come from the memo): run them, keep
+        the ones that fail. Taken cheapest first, as long as the CPU spent stays well under the seconds saved."""
+        heavy = sorted((n for n in chosen if self.ms[n] >= HEAVY_SECS * 1000), key=lambda n: self.cpu_own.get(n, self.ms[n] / 1000))
+        if not heavy or self.left() < 25:
+            return chosen
+        if any(fp.old is None or fp.new is None or fp.old != fp.new for fp in parse_patch(text)):
+            return chosen
+        patched = self.patched(text)
+        if patched is None or any(f.startswith("tests/fixtures/") for f in patched):
+            return chosen
+        base = cost_ms(chosen, self.ms) / 1000
+        pick = []
+        for k in range(1, len(heavy) + 1):
+            est = self.estimate(heavy[:k])
+            gain = base - cost_ms(chosen - set(heavy[:k]), self.ms) / 1000
+            if est <= HEAVYRUN_RATIO * gain:
+                pick = heavy[:k]
+        if not pick:
+            return chosen
+        est = self.estimate(pick)
+        r = self.start().run(patched, [self.id[n] for n in pick], stop=False, limit=min(max(15.0, 5 * est), self.left() - 5))
+        self.cpu += r.get("cpu", 0)
+        clean = r.get("rc") in (0, 1) and not r.get("collect") and not r.get("crash")
+        passed, failed = set(r.get("passed", ())), set(r.get("failed", ()))
+        drop = {n for n in pick if clean and self.id[n] in passed and self.id[n] not in failed}
+        log("heavy-run", name, [self.id[n].split("::")[-1] for n in pick], "est", round(est, 2), "cpu", r.get("cpu"), "dropped", len(drop))
+        return chosen - drop
+
+    def _check(self, name, text, chosen, all_count, sel=None):
         if not VERIFY or not chosen or len(chosen) > 0.5 * all_count or self.left() < 20:
             return chosen
         if any(fp.old is None or fp.new is None or fp.old != fp.new for fp in parse_patch(text)):
@@ -732,11 +851,43 @@ class Checker:
                     if pr.get("agree") and pr.get("n", 0) >= EQUIV_MIN_RUNS and pr.get("tests", 0) >= min(EQUIV_MIN_TESTS, len(chosen - heavy)):
                         return set()
                     chosen = chosen - set(pick)          # these passed for real; carry on with the rest
+        # An expensive test that loops over fixture records, and a change that only some records reach: run the test
+        # for real on just those records (cheapest first). Records that never reach the changed lines behave exactly
+        # as before, so the test fails on the whole file if and only if it fails on these.
+        settled = set()
+        if SELF and heavy and self.left() > 25:
+            for hv in sorted(heavy, key=lambda n: -self.ms[n]):
+                got = self.self_slice(sel, hv)
+                if not got:
+                    continue
+                fx, idxs, costs = got
+                est = 0.19 + self.cpu_setup.get(self.id[hv].rsplit("::", 1)[0], 0.0) + sum(costs[i] for i in idxs)
+                gain = (cost_ms(chosen, self.ms) - cost_ms(chosen - {hv}, self.ms)) / 1000
+                if est > SELF_RATIO * gain:
+                    log("self-slice", name, "records", len(idxs), "skipped: est", round(est, 1), "gain", round(gain, 1))
+                    continue
+                order = sorted(idxs, key=lambda i: (costs[i] < 0.03, costs[i]))
+                ok, used = True, 0.0
+                for part in (order[:SELF_FIRST], order[SELF_FIRST:]):
+                    if not part:
+                        continue
+                    r = self.start().run(patched, [self.id[hv]], stop=True, limit=min(max(15.0, 5 * est), self.left() - 5),
+                                         slice={"files": {fx: sorted(part)}})
+                    self.cpu += r.get("cpu", 0); used += r.get("cpu", 0) or 0
+                    if not (r.get("rc") == 0 and not r.get("failed") and not r.get("collect") and not r.get("crash")
+                            and self.id[hv] in set(r.get("passed", ()))):
+                        ok = False
+                        break
+                log("self-slice", name, self.id[hv].split("::")[-1], "records", len(idxs), "cpu", round(used, 2), "dropped" if ok else "kept")
+                settled.add(hv)
+                if ok:
+                    chosen = chosen - {hv}
+            heavy = heavy & chosen
         # An expensive test with a cheaper "proxy" (another class's test that reads the same fixture and executes
         # nearly the same lines): if the proxy also reaches this change and passes for real, drop the expensive one.
-        if PROXY and heavy:
+        if PROXY and heavy - settled:
             pairs = {}
-            for hv in heavy:
+            for hv in heavy - settled:
                 for sim, p in self.proxy.get(hv, ()):
                     if sim >= PROXY_SIM and p in chosen and p not in heavy and self.ms[p] < self.ms[hv]:
                         pairs[hv] = p
@@ -747,11 +898,26 @@ class Checker:
                 est = 0.25 + (self.estimate(px) - 0.19) * frac
                 gain = (cost_ms(chosen, self.ms) - cost_ms(chosen - set(pairs), self.ms)) / 1000
                 if est <= 0.6 * gain and self.left() > 20:
-                    r = self.start().run(patched, [self.id[n] for n in px], stop=True, limit=min(max(15.0, 6 * est), self.left() - 5), slice=spec)
+                    # Taste first: run the proxy on a few evenly spaced records. If several already fail, the change
+                    # is broad, the expensive test stays, and the rest of the proxy run is not worth its CPU.
+                    taste, rest = self.taste_spec(sel, px, spec) if TASTE else (None, None)
+                    t = None
+                    if taste:
+                        t = self.start().run(patched, [self.id[n] for n in px], stop=False, limit=min(15.0, self.left() - 5), slice=taste)
+                        self.cpu += t.get("cpu", 0)
+                        tclean = t.get("rc") in (0, 1) and not t.get("collect") and not t.get("crash")
+                        nfail = len(t.get("sub", ())) + len(t.get("whole", ()))
+                        if not tclean or nfail >= TASTE_STOP or (t.get("failed") and not t.get("sub")):
+                            log("proxy-taste", name, "failures", nfail, "cpu", t.get("cpu"), "-> keep")
+                            return chosen
+                        spec = rest
+                    r = self.start().run(patched, [self.id[n] for n in px], stop=not REFINE, limit=min(max(15.0, 6 * est), self.left() - 5), slice=spec, max_sub=REFINE_MAX if REFINE else 0)
                     self.cpu += r.get("cpu", 0)
-                    log("proxy-slice", name, "records %.0f%%" % (100 * frac))
+                    log("proxy-slice", name, "records %.0f%%" % (100 * frac), "taste cpu", t.get("cpu") if t else None)
                     clean = r.get("rc") in (0, 1) and not r.get("collect") and not r.get("crash")
-                    passed = {n for n in px if clean and self.id[n] in set(r.get("passed", ())) and self.id[n] not in set(r.get("failed", ()))}
+                    tfailed = set(t.get("failed", ())) if t else set()
+                    passed = {n for n in px if clean and self.id[n] in set(r.get("passed", ())) and self.id[n] not in set(r.get("failed", ()))
+                              and self.id[n] not in tfailed}
                     drop = {hv for hv, p in pairs.items() if p in passed}
                     if drop:
                         # guard: if any other candidate can no longer even be imported, the breakage is broad -> keep all
@@ -766,6 +932,39 @@ class Checker:
                     chosen = chosen - drop - passed
                     heavy = heavy - drop
                     if len(passed) < len(px):
+                        # A proxy failed. Its failing subtests name the fixture records whose result changed; run the
+                        # expensive test for real on just those records. Records the proxy still passes behave as before.
+                        if REFINE and clean and self.left() > 30:
+                            for hv, p in pairs.items():
+                                if p in passed or hv not in chosen:
+                                    continue
+                                recs = None if r.get("early") else self.failed_records(sel, p, r, spec)
+                                if recs and t:
+                                    more = self.failed_records(sel, p, t, taste)
+                                    recs = (recs[0], sorted(set(recs[1]) | set(more[1]))) if more else None
+                                if not recs or not recs[1]:
+                                    continue
+                                fx, idxs = recs
+                                est2 = 1.5 + len(idxs) * 0.45
+                                gain2 = (cost_ms(chosen, self.ms) - cost_ms(chosen - {hv}, self.ms)) / 1000
+                                if est2 > REFINE_RATIO * gain2:
+                                    log("refine", name, "records", len(idxs), "too many: est", round(est2, 1), "gain", round(gain2, 1))
+                                    continue
+                                others = sorted(chosen - heavy - set(px), key=lambda n: self.ms[n])
+                                if others:
+                                    g = self.v.run(patched, [self.id[n] for n in others], stop=True, limit=min(30.0, self.left() - 5), collect_only=True)
+                                    self.cpu += g.get("cpu", 0)
+                                    if g.get("rc") != 0 or g.get("collect") or g.get("crash") or g.get("failed"):
+                                        log("refine", name, "guard: candidates fail to import -> keep all")
+                                        return chosen
+                                h = self.v.run(patched, [self.id[hv]], stop=True, limit=min(max(20.0, 4 * est2), self.left() - 5),
+                                               slice={"files": {fx: idxs}})
+                                self.cpu += h.get("cpu", 0)
+                                ok = h.get("rc") == 0 and not h.get("failed") and not h.get("collect") and not h.get("crash") \
+                                    and self.id[hv] in set(h.get("passed", ()))
+                                log("refine", name, self.id[hv].split("::")[-1], "records", len(idxs), "cpu", h.get("cpu"), "dropped" if ok else "kept")
+                                if ok:
+                                    chosen = chosen - {hv}
                         return chosen                 # a proxy failed: keep everything else as selected
         rest = sorted(chosen - heavy, key=lambda n: self.ms[n])
         if not rest:
@@ -797,6 +996,15 @@ def main():
                  for t, v in sel.m.get("proxy", {}).items() if sel.tr[t] is not None}
     chk.cpu_own = {sel.tr[t]: c for t, c in sel.m.get("cpu_own", {}).items() if sel.tr[t] is not None}
     chk.cpu_setup = sel.m.get("cpu_setup", {})
+    try:                                      # real CPU of tests whose DuckDB queries are answered from the memo
+        here = Path(__file__).resolve().parent
+        memo_cost = json.loads((here / "duck_cost.json").read_text()) if (here / "duck.pkl.z").exists() else {}
+    except Exception:
+        memo_cost = {}
+    num = {v: k for k, v in chk.id.items()}
+    for nid, c in memo_cost.items():
+        if nid in num:
+            chk.cpu_own[num[nid]] = c
     patches = sorted((DATA / "commits").glob("*.patch"))
     if os.environ.get("BR_ONLY"):               # development aid: restrict to listed commit ids
         only = set(open(os.environ["BR_ONLY"]).read().split())

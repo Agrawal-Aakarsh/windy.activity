@@ -52,7 +52,7 @@ class Verifier:
             return None
         return r
 
-    def run(self, patched, ids, stop=True, limit=60, probe=None, collect_only=False, slice=None):
+    def run(self, patched, ids, stop=True, limit=60, probe=None, collect_only=False, slice=None, max_sub=0, duck=True):
         """patched: {relative path: new text or None (deleted)}. Returns the zygote's result dict."""
         req = {"ids": ids, "stop": stop, "limit": limit}
         if collect_only:
@@ -61,6 +61,10 @@ class Verifier:
             req["probe"] = probe
         if slice:
             req["slice"] = slice
+        if max_sub:
+            req["max_sub"] = max_sub
+        if not duck:
+            req["duck"] = False
         return self._request(patched, req)
 
     def _request(self, patched, req):
