@@ -256,6 +256,100 @@ def _fast_multiline(self, first, second, msg=None):
 unittest.TestCase.assertMultiLineEqual = _fast_multiline
 
 
+def tree_print(e, out):
+    """A complete structural description of a syntax tree (node classes, every argument in order, types, comments,
+    meta). It only reads plain attributes, so it does not depend on any sqlglot code a patch could change."""
+    args = getattr(e, "args", None)
+    if isinstance(args, dict) and hasattr(e, "arg_key"):
+        out.append("<" + type(e).__name__)
+        for k, v in args.items():
+            out.append(k + "=")
+            tree_print(v, out)
+        t = getattr(e, "_type", None)
+        if t is not None:
+            out.append("type=")
+            tree_print(t, out)
+        c = getattr(e, "comments", None)
+        if c:
+            out.append("comments=" + repr(c))
+        m = getattr(e, "_meta", None)
+        if m:
+            out.append("meta=" + repr(sorted(m.items(), key=repr)))
+        out.append(">")
+    elif isinstance(e, (list, tuple)):
+        out.append("[")
+        for x in e:
+            tree_print(x, out)
+        out.append("]")
+    elif isinstance(e, dict):
+        out.append("{")
+        for k in sorted(e, key=repr):
+            out.append(repr(k) + ":")
+            tree_print(e[k], out)
+        out.append("}")
+    elif isinstance(e, (set, frozenset)):
+        out.append("set" + repr(sorted(map(repr, e))))
+    else:
+        out.append(repr(e) + ",")
+
+
+class _StopAfterOptimize(BaseException):
+    pass
+
+
+def opt_child(req, wfd):
+    """For the given records of a fixture: do what the executor test does with each query up to and including the
+    optimizer step (the same functions the test calls), and report a fingerprint of the optimized tree."""
+    import hashlib
+    out = {"ok": False}
+    t0 = time.process_time()
+    try:
+        import sqlglot.executor as X
+        import tests.test_executor as TE
+        import tests.helpers as H
+        schema = getattr(TE, req["schema"])
+        got = []
+        real = X.optimize
+
+        def stub(*a, **k):
+            got.append(real(*a, **k))
+            raise _StopAfterOptimize()
+
+        X.optimize = stub
+
+        class Tables(dict):
+            def __missing__(self, key):
+                return []
+
+        TE.initializer(schema, Tables())
+        recs = list(H.load_sql_fixture_pairs(req["fx"]))
+        fps, cpu = {}, {}
+        for i in req["records"]:
+            t1 = time.process_time()
+            if i >= len(recs):
+                fps[i] = "missing"
+                continue
+            meta, sql, _ = recs[i]
+            del got[:]
+            try:
+                expr = pickle.loads(pickle.dumps(TE.parse_one(sql)))
+                r = TE.mp_execute(expr, meta)
+                fps[i] = "none" if r is None else "returned"
+            except _StopAfterOptimize:
+                parts = []
+                tree_print(got[-1], parts)
+                fps[i] = hashlib.blake2b("".join(parts).encode(), digest_size=10).hexdigest()
+            except BaseException as e:
+                fps[i] = "raised:" + type(e).__name__
+            cpu[i] = round(time.process_time() - t1, 4)
+        out = {"ok": True, "fps": fps, "rec_cpu": cpu}
+    except BaseException as e:
+        out = {"ok": False, "error": repr(e)[:300]}
+    out["cpu"] = round(time.process_time() - t0, 3)
+    os.write(wfd, json.dumps(out).encode())
+    os._exit(0)
+
+
 def child(req, wfd):
     LAZY[0] = bool(req.get("lazy"))
     if duckmemo is not None and not req.get("duck", True):
@@ -264,6 +358,8 @@ def child(req, wfd):
     os.dup2(devnull, 1); os.dup2(devnull, 2)
     if req.get("op") in ("state", "baseline"):
         state_child(req, wfd)
+    if req.get("op") == "opt":
+        opt_child(req, wfd)
     if req.get("probe"):
         install_probe(req["probe"])
     if req.get("slice"):

@@ -96,6 +96,12 @@ class Verifier:
                 if src.exists():
                     os.symlink(src, p)
 
+    def opt(self, patched, fx, schema, records, limit=60):
+        """Optimizer-step fingerprints of the given fixture records under the patched code (see zygote.opt_child)."""
+        r = self._request({**self.extra, **patched}, {"op": "opt", "fx": fx, "schema": schema, "records": list(records), "limit": limit})
+        self.last = r or {}
+        return r
+
     def close(self):
         try:
             self.proc.stdin.close(); self.proc.wait(timeout=5)

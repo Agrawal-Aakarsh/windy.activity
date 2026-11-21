@@ -516,6 +516,8 @@ TASTE = os.environ.get("BR_TASTE", "1") == "1"                    # sample a few
 TASTE_N = int(os.environ.get("BR_TASTE_N", "10"))
 TASTE_MIN = int(os.environ.get("BR_TASTE_MIN", "30"))
 TASTE_STOP = int(os.environ.get("BR_TASTE_STOP", "3"))
+OPT = os.environ.get("BR_OPT", "0") == "1"                        # compare optimizer-step output with the pinned commit's
+OPT_RATIO = float(os.environ.get("BR_OPT_RATIO", "0.5"))
 SELF = os.environ.get("BR_SELF", "0") == "1"                      # run a record-looping heavy test on the records that reach the change
 SELF_RATIO = float(os.environ.get("BR_SELF_RATIO", "0.5"))
 SELF_FIRST = int(os.environ.get("BR_SELF_FIRST", "6"))
@@ -712,10 +714,13 @@ class Checker:
         (fx, info), = recmap.items()
         if fx in self.norec:
             return None
-        mask, seen = 0, False
+        mask, seen, inner = 0, False, "optfp" in info
+        if "outside_sets" not in info:
+            info["outside_sets"] = {f: set(v) for f, v in info.get("outside", {}).items()}
         for f, lo, hi in sel.touched:
             static = sel.m["lines"].get(f, {})
             d = info["lines"].get(f, {})
+            out = info["outside_sets"].get(f, ())
             for l in range(lo, hi + 1):
                 if t in static.get(l, ()):
                     if not d.get(l):
@@ -723,9 +728,13 @@ class Checker:
                     mask |= d[l]; seen = True
                 elif d.get(l):
                     mask |= d[l]; seen = True
+                else:
+                    continue
+                if l in out:
+                    inner = False            # this line also runs outside the optimizer step
         if not seen:
             return None
-        return fx, [i for i in range(info["n"]) if mask >> i & 1], info["cpu"]
+        return fx, [i for i in range(info["n"]) if mask >> i & 1], info["cpu"], (info if inner else None)
 
     def taste_spec(self, sel, tests, spec):
         """(sample slice, slice for the remaining records) for a first quick look, or (None, None)."""
@@ -899,11 +908,50 @@ class Checker:
                 got = self.self_slice(sel, hv)
                 if not got:
                     continue
-                fx, idxs, costs = got
-                est = 0.19 + self.cpu_setup.get(self.id[hv].rsplit("::", 1)[0], 0.0) + sum(costs[i] for i in idxs)
+                fx, idxs, costs, inner = got
                 gain = (cost_ms(chosen, self.ms) - cost_ms(chosen - {hv}, self.ms)) / 1000
+                changed_known = False
+                if OPT and inner is not None:
+                    # Every changed line runs only inside the optimizer step of this test. So first redo just that
+                    # step for the records that reach the change and compare each optimized tree with the one from
+                    # the pinned commit. A record whose tree is identical goes on exactly as before.
+                    est_o = 0.3 + sum(inner["optcpu"][i] for i in idxs)
+                    if est_o <= OPT_RATIO * gain:
+                        todo, first, hopeless = list(idxs), {}, False
+                        setup = 0.19 + self.cpu_setup.get(self.id[hv].rsplit("::", 1)[0], 0.0)
+                        if len(idxs) >= 30:
+                            # look at ten evenly spaced records first: if most of them changed, running all the
+                            # changed ones for real is out of reach and the rest of this step is not worth doing
+                            step = len(idxs) / 10
+                            sample = sorted({idxs[int(k * step + step / 2)] for k in range(10)})
+                            o1 = self.start().opt(patched, fx, inner["schema"], sample, limit=min(15.0, self.left() - 5))
+                            self.cpu += (o1 or {}).get("cpu", 0)
+                            if o1 and o1.get("ok"):
+                                first = o1["fps"]
+                                frac = sum(1 for i in sample if first.get(str(i)) != inner["optfp"][i]) / len(sample)
+                                todo = [i for i in idxs if i not in set(sample)]
+                                if setup + frac * sum(costs[i] for i in idxs) > 1.5 * SELF_RATIO * gain:
+                                    log("opt-step", name, "sample changed %.0f%%" % (100 * frac), "cpu", o1.get("cpu"), "-> keep")
+                                    settled.add(hv)
+                                    hopeless = True
+                        if hopeless:
+                            continue
+                        o = self.start().opt(patched, fx, inner["schema"], todo, limit=min(max(15.0, 6 * est_o), self.left() - 5))
+                        self.cpu += (o or {}).get("cpu", 0)
+                        if o and o.get("ok"):
+                            o["fps"].update(first)
+                            diff = [i for i in idxs if o["fps"].get(str(i)) != inner["optfp"][i]]
+                            log("opt-step", name, "records", len(idxs), "changed", len(diff), "cpu", o.get("cpu"))
+                            if not diff:
+                                chosen = chosen - {hv}
+                                settled.add(hv)
+                                continue
+                            idxs, changed_known = diff, True
+                est = 0.19 + self.cpu_setup.get(self.id[hv].rsplit("::", 1)[0], 0.0) + sum(costs[i] for i in idxs)
                 if est > SELF_RATIO * gain:
                     log("self-slice", name, "records", len(idxs), "skipped: est", round(est, 1), "gain", round(gain, 1))
+                    if changed_known:
+                        settled.add(hv)      # the optimized queries did change and running them all costs too much: keep
                     continue
                 # one run, cheapest records first, each record checked right after it is computed: a failing test
                 # stops at its first failing record
