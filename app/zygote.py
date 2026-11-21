@@ -36,12 +36,36 @@ except Exception:
     duckmemo = None
 
 
+LAZY = [False]
+
+
+class LazyFuture(Future):
+    """Pool work that is done when its result is first asked for (same pickle round trip). A test that reads its
+    futures one by one then checks each piece of work right after doing it, so a failing run can stop early."""
+    def __init__(self, fn, a, k):
+        super().__init__()
+        self._job = (fn, a, k)
+
+    def result(self, timeout=None):
+        if self._job is not None:
+            fn, a, k = self._job
+            self._job = None
+            try:
+                a2, k2 = pickle.loads(pickle.dumps((a, k)))
+                self.set_result(pickle.loads(pickle.dumps(fn(*a2, **k2))))
+            except BaseException as e:
+                self.set_exception(e)
+        return super().result(timeout)
+
+
 class InProcessPool:
     """Runs pool work in this process (with the same pickle round trip) to avoid spawning workers."""
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=()):
         if initializer:
             initializer(*pickle.loads(pickle.dumps(initargs)))
     def submit(self, fn, *a, **k):
+        if LAZY[0]:
+            return LazyFuture(fn, a, k)
         f = Future()
         try:
             a2, k2 = pickle.loads(pickle.dumps((a, k)))
@@ -186,6 +210,7 @@ def install_slice(spec):
     (an unchanged file yields nothing). If the number of records changed, the whole file is yielded."""
     import tests.helpers as H
     keep = {k: set(v) for k, v in (spec.get("files") or {}).items()}
+    order = {k: list(v) for k, v in (spec.get("ordered") or {}).items()}     # these records, in exactly this order
     pristine = spec.get("changed")
     for fname in ("load_sql_fixtures", "load_sql_fixture_pairs"):
         orig = getattr(H, fname)
@@ -204,6 +229,12 @@ def install_slice(spec):
                 for a, b in zip(old, new):
                     if a != b:
                         yield b
+                return
+            if filename in order:
+                recs = list(_o(filename))
+                for i in order[filename]:
+                    if i < len(recs):
+                        yield recs[i]
                 return
             if filename in keep:
                 for i, rec in enumerate(_o(filename)):
@@ -226,6 +257,7 @@ unittest.TestCase.assertMultiLineEqual = _fast_multiline
 
 
 def child(req, wfd):
+    LAZY[0] = bool(req.get("lazy"))
     if duckmemo is not None and not req.get("duck", True):
         duckmemo.ON = False
     devnull = os.open(os.devnull, os.O_WRONLY)

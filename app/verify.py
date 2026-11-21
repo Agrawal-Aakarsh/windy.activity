@@ -54,7 +54,7 @@ class Verifier:
             return None
         return r
 
-    def run(self, patched, ids, stop=True, limit=60, probe=None, collect_only=False, slice=None, max_sub=0, duck=True):
+    def run(self, patched, ids, stop=True, limit=60, probe=None, collect_only=False, slice=None, max_sub=0, duck=True, lazy=False):
         """patched: {relative path: new text or None (deleted)}. Returns the zygote's result dict."""
         patched = {**self.extra, **patched}
         req = {"ids": ids, "stop": stop, "limit": limit}
@@ -68,6 +68,8 @@ class Verifier:
             req["max_sub"] = max_sub
         if not duck:
             req["duck"] = False
+        if lazy:
+            req["lazy"] = True
         return self._request(patched, req)
 
     def _request(self, patched, req):

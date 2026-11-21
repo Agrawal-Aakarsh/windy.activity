@@ -837,6 +837,7 @@ class Checker:
         if not all(f.endswith(".py") for f in patched):
             return chosen          # a data file some candidate reads changed: running it would almost surely just confirm that
         heavy = {n for n in chosen if self.ms[n] >= HEAVY_SECS * 1000}
+        known_fail = False
         # A patch that only swaps the operator of one comparison: run some of the cheapest candidates and apply the
         # old and the new operator side by side to the values that actually reach that line (and to nearby inputs).
         # If the two never disagree over enough executions, the change is not observable and nothing needs to run.
@@ -865,10 +866,11 @@ class Checker:
                         and set(r.get("passed", ())) >= {self.id[n] for n in pick}
                     log("equiv", name, sw["old"], "->", sw["new"], "tests", len(pick), "cpu", r.get("cpu"), "probe", pr, "passed", passed)
                     if not passed:
-                        return chosen
-                    if pr.get("agree") and pr.get("n", 0) >= EQUIV_MIN_RUNS and pr.get("tests", 0) >= min(EQUIV_MIN_TESTS, len(chosen - heavy)):
+                        known_fail = True            # a cheap candidate fails; the expensive ones still get their own checks
+                    elif pr.get("agree") and pr.get("n", 0) >= EQUIV_MIN_RUNS and pr.get("tests", 0) >= min(EQUIV_MIN_TESTS, len(chosen - heavy)):
                         return set()
-                    chosen = chosen - set(pick)          # these passed for real; carry on with the rest
+                    else:
+                        chosen = chosen - set(pick)      # these passed for real; carry on with the rest
         if wide:
             return chosen
         # An expensive test that loops over fixture records, and a change that only some records reach: run the test
@@ -886,18 +888,14 @@ class Checker:
                 if est > SELF_RATIO * gain:
                     log("self-slice", name, "records", len(idxs), "skipped: est", round(est, 1), "gain", round(gain, 1))
                     continue
+                # one run, cheapest records first, each record checked right after it is computed: a failing test
+                # stops at its first failing record
                 order = sorted(idxs, key=lambda i: (costs[i] < 0.03, costs[i]))
-                ok, used = True, 0.0
-                for part in (order[:SELF_FIRST], order[SELF_FIRST:]):
-                    if not part:
-                        continue
-                    r = self.start().run(patched, [self.id[hv]], stop=True, limit=min(max(15.0, 5 * est), self.left() - 5),
-                                         slice={"files": {fx: sorted(part)}})
-                    self.cpu += r.get("cpu", 0); used += r.get("cpu", 0) or 0
-                    if not (r.get("rc") == 0 and not r.get("failed") and not r.get("collect") and not r.get("crash")
-                            and self.id[hv] in set(r.get("passed", ()))):
-                        ok = False
-                        break
+                r = self.start().run(patched, [self.id[hv]], stop=True, limit=min(max(15.0, 5 * est), self.left() - 5),
+                                     slice={"ordered": {fx: order}}, lazy=True)
+                self.cpu += r.get("cpu", 0); used = r.get("cpu", 0) or 0
+                ok = r.get("rc") == 0 and not r.get("failed") and not r.get("collect") and not r.get("crash") \
+                    and self.id[hv] in set(r.get("passed", ()))
                 log("self-slice", name, self.id[hv].split("::")[-1], "records", len(idxs), "cpu", round(used, 2), "dropped" if ok else "kept")
                 settled.add(hv)
                 if ok:
@@ -978,7 +976,7 @@ class Checker:
                                         log("refine", name, "guard: candidates fail to import -> keep all")
                                         return chosen
                                 h = self.v.run(patched, [self.id[hv]], stop=True, limit=min(max(20.0, 4 * est2), self.left() - 5),
-                                               slice={"files": {fx: idxs}})
+                                               slice={"files": {fx: idxs}}, lazy=True)
                                 self.cpu += h.get("cpu", 0)
                                 ok = h.get("rc") == 0 and not h.get("failed") and not h.get("collect") and not h.get("crash") \
                                     and self.id[hv] in set(h.get("passed", ()))
@@ -987,7 +985,7 @@ class Checker:
                                     chosen = chosen - {hv}
                         return chosen                 # a proxy failed: keep everything else as selected
         rest = sorted(chosen - heavy, key=lambda n: self.ms[n])
-        if not rest:
+        if not rest or known_fail:
             return chosen
         est = self.estimate(rest)
         gain = cost_ms(chosen, self.ms) / 1000 if (SKIP_HEAVY or not heavy) else (cost_ms(chosen, self.ms) - cost_ms(heavy, self.ms)) / 1000
