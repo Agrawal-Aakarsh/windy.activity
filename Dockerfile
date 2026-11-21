@@ -16,6 +16,5 @@ COPY app /app
 RUN python -m compileall -q /app && chmod -R a+rX /app
 
 ENV BR_SG=/sqlglot BR_DATA=/data PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0
-# Optional settings (see HANDOFF.md). Uncomment to turn on the side-by-side comparison probe:
-ENV BR_EQUIV=1
+ENV BR_EQUIV=1 BR_PROXY=1 BR_FIXSLICE=1
 CMD ["python", "/app/selector.py"]

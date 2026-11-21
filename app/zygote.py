@@ -163,6 +163,41 @@ def install_probe(spec):
     mon.set_events(tool, mon.events.LINE)
 
 
+def install_slice(spec):
+    """Make the test helpers' fixture loaders yield only some records.
+    {"files": {name: [indexes]}}: only those records of those files (other files untouched).
+    {"changed": pristine_fixture_dir}: only records that differ from the pinned commit's copy, for every file
+    (an unchanged file yields nothing). If the number of records changed, the whole file is yielded."""
+    import tests.helpers as H
+    keep = {k: set(v) for k, v in (spec.get("files") or {}).items()}
+    pristine = spec.get("changed")
+    for fname in ("load_sql_fixtures", "load_sql_fixture_pairs"):
+        orig = getattr(H, fname)
+        def wrapped(filename, _o=orig):
+            if pristine:
+                new = list(_o(filename))
+                saved = H.FIXTURES_DIR
+                H.FIXTURES_DIR = pristine
+                try:
+                    old = list(_o(filename))
+                finally:
+                    H.FIXTURES_DIR = saved
+                if len(old) != len(new):
+                    yield from new
+                    return
+                for a, b in zip(old, new):
+                    if a != b:
+                        yield b
+                return
+            if filename in keep:
+                for i, rec in enumerate(_o(filename)):
+                    if i in keep[filename]:
+                        yield rec
+                return
+            yield from _o(filename)
+        setattr(H, fname, wrapped)
+
+
 def child(req, wfd):
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1); os.dup2(devnull, 2)
@@ -170,10 +205,18 @@ def child(req, wfd):
         state_child(req, wfd)
     if req.get("probe"):
         install_probe(req["probe"])
+    if req.get("slice"):
+        try:
+            install_slice(req["slice"])
+        except BaseException:           # helpers cannot be imported: report as a crash, the caller keeps everything
+            os.write(wfd, json.dumps({"rc": -1, "failed": [], "collect": [], "passed": [], "crash": True}).encode())
+            os._exit(0)
     plug = Plug(wfd, bool(req.get("stop", True)))
     args = list(req["ids"]) + ["-p", "no:cacheprovider", "-q", "--assert=plain"]
     if req.get("stop", True):
         args.append("-x")
+    if req.get("collect_only"):
+        args.append("--collect-only")       # only check that every requested test can still be imported and found
     try:
         rc = int(pytest.main(args, plugins=[plug]))
     except BaseException as e:      # noqa

@@ -144,6 +144,8 @@ class Selector:
         self.lines, self.imp = m["lines"], {f: set(v) for f, v in m["import_lines"].items()}
         self.struct, self.refs, self.used = m["struct"], m["refs"], m["used"]
         self.modfile = {v["module"]: f for f, v in m["struct"].items()}
+        self.rev = {n: i for i, n in enumerate(self.tr) if n is not None}     # test number -> map index
+        self.touched, self.line_only = [], True
         self.texts, self.name_cache, self.pending = None, {}, []
 
     def T(self, idxs):
@@ -218,11 +220,13 @@ class Selector:
         sc, st = self.scope(f, line), self.stmt(f, line)
         if sc is not None and sc[2] in ("func", "lambda"):
             if sc[2] == "lambda":
+                self.touched.append((f, sc[0], sc[1]))
                 return self.cov(f, sc[0], sc[1]), None
             if line < sc[4] or st is None or not (sc[0] <= st[0] and st[1] <= sc[1]):
                 lo, hi = sc[4], sc[1]          # signature, decorator or a line between statements
             else:
                 lo, hi = st[0], st[1]
+            self.touched.append((f, lo, hi))
             out = self.cov(f, lo, hi)
             if line < sc[4] or any(l in self.imp.get(f, ()) for l in range(lo, hi + 1)):
                 return out, ("import", self.fallback(f))   # this code (or its signature) takes effect while importing
@@ -390,8 +394,11 @@ class Selector:
 
     def select(self, text):
         """Returns (tests reachable at run time, [static answers for import-time effects])."""
-        self.pending = []
-        return self._select(text), self.pending
+        self.pending, self.touched, self.line_only = [], [], True
+        out = self._select(text)
+        if self.pending:
+            self.line_only = False            # some candidates come from import-time state, not from executed lines
+        return out, self.pending
 
     def _select(self, text):
         out = set()
@@ -399,6 +406,8 @@ class Selector:
             f = fp.old or fp.new
             if f is None:
                 continue
+            if not (f.startswith("sqlglot/") and f.endswith(".py")):
+                self.line_only = False        # candidates that do not come from executed source lines
             if os.path.basename(f) in ("conftest.py", "pytest.ini", "tox.ini"):
                 out |= self.all
             elif f in GLOBAL_CONFIG:
@@ -484,9 +493,12 @@ SLOW_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
 EQUIV = os.environ.get("BR_EQUIV", "0") == "1"                    # side-by-side check of a swapped comparison operator
 EQUIV_CONST = os.environ.get("BR_EQUIV_CONST", "0") == "1"        # literal operand: do not vary that side in the probe
 EQUIV_BUDGET = float(os.environ.get("BR_EQUIV_BUDGET", "2.0"))    # CPU seconds of cheap candidates to observe
-EQUIV_MAX_TESTS = int(os.environ.get("BR_EQUIV_MAX_TESTS", "25"))
+EQUIV_MAX_TESTS = int(os.environ.get("BR_EQUIV_MAX_TESTS", "12"))
+EQUIV_PER_CLASS = int(os.environ.get("BR_EQUIV_PER_CLASS", "4"))
 EQUIV_MIN_RUNS = int(os.environ.get("BR_EQUIV_MIN_RUNS", "20"))
 EQUIV_MIN_TESTS = int(os.environ.get("BR_EQUIV_MIN_TESTS", "3"))
+SLICE = os.environ.get("BR_SLICE", "1") == "1"                    # run fixture-driven proxies only on the records that reach the change
+FIXSLICE = os.environ.get("BR_FIXSLICE", "0") == "1"              # fixture-only patches: run candidates on the changed records only
 PROXY = os.environ.get("BR_PROXY", "0") == "1"
 PROXY_SIM = float(os.environ.get("BR_PROXY_SIM", "0.6"))
 
@@ -565,7 +577,7 @@ class Checker:
         self.id = {t["number"]: t["id"] for t in tests}
         self.file = {t["number"]: t["file"] for t in tests}
         self.cpu = 0.0
-        self.proxy, self.cpu_own, self.cpu_setup = {}, {}, {}
+        self.proxy, self.cpu_own, self.cpu_setup, self.base_sets = {}, {}, {}, {}
         self.deadline = time.time() + 100
 
     def start(self):
@@ -622,6 +634,32 @@ class Checker:
         log("state", name, r["n"], "items", r["changed"][:3], "->", len(got))
         return chosen | got
 
+    def slice_for(self, sel, tests):
+        """Fixture records these tests need to run to exercise the changed lines. Returns (slice spec or None, fraction)."""
+        if not SLICE or sel is None or not sel.line_only or not sel.touched:
+            return None, 1.0
+        files, num, den = {}, 0, 0
+        for n in tests:
+            recmap = sel.m.get("rec", {}).get(sel.rev.get(n))
+            if not recmap:
+                return None, 1.0
+            base = sel.m.get("rec_base", {}).get(sel.rev.get(n), {})
+            for f, lo, hi in sel.touched:
+                bl = self.base_sets.setdefault((n, f), set(base.get(f, ())))
+                if any(l in bl for l in range(lo, hi + 1)):
+                    return None, 1.0      # the change also runs outside the per-record loop: every record is affected
+            for fx, info in recmap.items():
+                mask = 0
+                for f, lo, hi in sel.touched:
+                    d = info["lines"].get(f)
+                    if d:
+                        for l in range(lo, hi + 1):
+                            mask |= d.get(l, 0)
+                idxs = {i for i in range(info["n"]) if mask >> i & 1}
+                files[fx] = sorted(set(files.get(fx, ())) | idxs)
+                num += len(idxs); den += info["n"]
+        return {"files": files}, (num / den if den else 1.0)
+
     def estimate(self, nums):
         """Expected CPU seconds to run these tests for real (measured per test when the map has it)."""
         c, classes = 0.19, set()
@@ -636,7 +674,7 @@ class Checker:
     def left(self):
         return self.deadline - time.time()
 
-    def check(self, name, text, chosen, all_count):
+    def check(self, name, text, chosen, all_count, sel=None):
         if not VERIFY or not chosen or len(chosen) > 0.5 * all_count or self.left() < 20:
             return chosen
         if any(fp.old is None or fp.new is None or fp.old != fp.new for fp in parse_patch(text)):
@@ -644,6 +682,20 @@ class Checker:
         patched = self.patched(text)
         if patched is None:
             return chosen
+        if FIXSLICE and all(f.startswith("tests/fixtures/") and f.endswith(".sql") for f in patched) \
+                and any(self.ms[n] >= HEAVY_SECS * 1000 for n in chosen) and self.left() > 30:
+            # Only fixture records changed, and an expensive test reads the file. Run every candidate for real with the
+            # fixture loaders yielding just the records that differ from the pinned commit: unchanged records behave
+            # exactly as before, so a candidate fails here if and only if it fails on the whole file.
+            order = sorted(chosen, key=lambda n: self.ms[n])
+            r = self.start().run(patched, [self.id[n] for n in order], stop=False, limit=min(90.0, self.left() - 5),
+                                 slice={"changed": str(SG / "tests" / "fixtures")})
+            self.cpu += r.get("cpu", 0)
+            clean = r.get("rc") in (0, 1) and not r.get("collect") and not r.get("crash")
+            passed, failed = set(r.get("passed", ())), set(r.get("failed", ()))
+            keep = {n for n in chosen if self.id[n] in failed or self.id[n] not in passed} if clean else set(chosen)
+            log("fixslice", name, "candidates", len(chosen), "cpu", r.get("cpu"), "kept", len(keep), "clean", clean)
+            return keep
         if not all(f.endswith(".py") for f in patched):
             return chosen          # a data file some candidate reads changed: running it would almost surely just confirm that
         heavy = {n for n in chosen if self.ms[n] >= HEAVY_SECS * 1000}
@@ -661,7 +713,7 @@ class Checker:
                 pick, used, per_cls = [], 0.19, {}
                 for n in sorted(chosen - heavy, key=cost):
                     k = self.id[n].rsplit("::", 1)[0]
-                    if per_cls.get(k, 0) >= 8:
+                    if per_cls.get(k, 0) >= EQUIV_PER_CLASS:
                         continue
                     c = cost(n) + 0.05                      # plus per-test runner overhead
                     if pick and (used + c > EQUIV_BUDGET or len(pick) >= EQUIV_MAX_TESTS):
@@ -690,14 +742,25 @@ class Checker:
                         break
             if pairs:
                 px = sorted(set(pairs.values()), key=lambda n: self.ms[n])
-                est = self.estimate(px)
+                spec, frac = self.slice_for(sel, px)
+                est = 0.25 + (self.estimate(px) - 0.19) * frac
                 gain = (cost_ms(chosen, self.ms) - cost_ms(chosen - set(pairs), self.ms)) / 1000
                 if est <= 0.6 * gain and self.left() > 20:
-                    r = self.start().run(patched, [self.id[n] for n in px], stop=True, limit=min(max(15.0, 6 * est), self.left() - 5))
+                    r = self.start().run(patched, [self.id[n] for n in px], stop=True, limit=min(max(15.0, 6 * est), self.left() - 5), slice=spec)
                     self.cpu += r.get("cpu", 0)
+                    log("proxy-slice", name, "records %.0f%%" % (100 * frac))
                     clean = r.get("rc") in (0, 1) and not r.get("collect") and not r.get("crash")
                     passed = {n for n in px if clean and self.id[n] in set(r.get("passed", ())) and self.id[n] not in set(r.get("failed", ()))}
                     drop = {hv for hv, p in pairs.items() if p in passed}
+                    if drop:
+                        # guard: if any other candidate can no longer even be imported, the breakage is broad -> keep all
+                        others = sorted(chosen - heavy - set(px), key=lambda n: self.ms[n])
+                        if others:
+                            g = self.v.run(patched, [self.id[n] for n in others], stop=True, limit=min(30.0, self.left() - 5), collect_only=True)
+                            self.cpu += g.get("cpu", 0)
+                            if g.get("rc") != 0 or g.get("collect") or g.get("crash") or g.get("failed"):
+                                log("proxy", name, "guard: candidates fail to import -> keep all")
+                                return chosen
                     log("proxy", name, [self.id[n].split("::")[-1] for n in px], "cpu", r.get("cpu"), "dropped", len(drop))
                     chosen = chosen - drop - passed
                     heavy = heavy - drop
@@ -749,7 +812,7 @@ def main():
             log("fallback", patch.stem, repr(e)); chosen = set(sel.all)
         static_n = len(chosen)
         try:
-            chosen = chk.check(patch.stem, text, chosen, len(sel.all))
+            chosen = chk.check(patch.stem, text, chosen, len(sel.all), sel)
         except Exception as e:
             log("verify-error", patch.stem, repr(e))
         print(json.dumps({"commit": patch.stem, "workers": pack(chosen, ms)}), flush=True)
