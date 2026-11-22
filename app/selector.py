@@ -38,6 +38,7 @@ def log(*a):
     print(*a, file=sys.stderr)
 
 
+TELEM2 = os.environ.get("BR_TELEM2", "0") == "1"                  # DIAGNOSTIC ONLY (see telemetry_wide() below)
 TELEM = os.environ.get("BR_TELEM", "0") == "1"                    # DIAGNOSTIC ONLY (see telemetry() below)
 
 
@@ -1313,6 +1314,48 @@ def telemetry_code(lines, in_final, wide):
     return 7 if wide else 8
 
 
+def telemetry_wide(text, lines):
+    """DIAGNOSTIC ONLY. Four digits describing a commit on which more than half of all tests were selected:
+    file (1 tokens.py, 2 parser.py, 3 generator.py, 4 dialects/dialect.py, 5 expressions/, 6 other sqlglot, 7 not
+    sqlglot source, 8 several files), how it was handled (1 import check found changed values, 2 some module no
+    longer imports, 3 too many changed values, 4 import check found nothing, 5 no import check), type of the single
+    changed literal (1 true/false, 2 text, 3 number, 4 None, 5 not a single literal), and how many values the import
+    check reported as changed (9 = nine or more)."""
+    fps = parse_patch(text)
+    f = (fps[0].old or fps[0].new or "") if len(fps) == 1 else None
+    if f is None:
+        d1 = 8
+    elif not (f.startswith("sqlglot/") and f.endswith(".py")):
+        d1 = 7
+    else:
+        d1 = {"sqlglot/tokens.py": 1, "sqlglot/parser.py": 2, "sqlglot/generator.py": 3, "sqlglot/dialects/dialect.py": 4}.get(
+            f, 5 if f.startswith("sqlglot/expressions/") else 6)
+    st = [l for l in lines if l.startswith("state ")]
+    d2, d4 = 5, 0
+    for l in st:
+        m = re.search(r" (\d+) items ", l)
+        if m:
+            d2, d4 = 1, min(9, int(m.group(1)))
+        elif "fail to import" in l or "import failed" in l:
+            d2 = 2
+        elif "many items" in l:
+            d2 = 3
+        elif "no change" in l:
+            d2 = 4
+    d3 = 5
+    try:
+        if f and d1 < 7:
+            import cond
+            old = (SG / f).read_text(encoding="utf-8")
+            pair = cond._diff(parse_src(old), parse_src(fps[0].apply(old)), set(fps[0].removed) | set(fps[0].insert_points))
+            if pair and isinstance(pair[0], ast.Constant) and isinstance(pair[1], ast.Constant):
+                v = pair[0].value
+                d3 = 1 if isinstance(v, bool) else 2 if isinstance(v, (str, bytes)) else 3 if isinstance(v, (int, float)) else 4
+    except Exception:
+        pass
+    return d1 * 1000 + d2 * 100 + d3 * 10 + d4
+
+
 def telemetry(results, codes, n_state, ms):
     """DIAGNOSTIC ONLY. Adds extra, unneeded tests to the busiest worker of some commits so that the total
     simulated time grows by exactly  n_state * 10 s + 0.dddd s, where the d are the per-commit codes above
@@ -1323,6 +1366,8 @@ def telemetry(results, codes, n_state, ms):
         digits[0] = 9
     digits += [0] * (4 - len(digits))
     target = n_state * 10000 + digits[0] * 1000 + digits[1] * 100 + digits[2] * 10 + digits[3]
+    if TELEM2:                                     # second diagnostic: (number of wide commits) * 10 s + 4 digits about the first
+        target = n_state
     log("telemetry", "state calls", n_state, "codes", codes, "extra ms", target)
     for name, workers in results:
         if target <= 0:
@@ -1415,7 +1460,7 @@ def main():
         patches = [p for p in patches if p.stem in only]
     # the batch limit is 3 minutes (4.5 in the larger final); stop running things for real well before it
     chk.deadline = T0 + float(os.environ.get("BR_BUDGET", "110" if len(patches) <= 45 else "170"))
-    results, codes = [], []
+    results, codes, wides = [], [], []
     big = [n for n in sel.all if chk.id[n].endswith("::test_execute_tpcds")]
     for patch in patches:
         mark = len(LOGBUF)
@@ -1462,7 +1507,11 @@ def main():
             only = [x for x in os.environ.get("BR_DROP_ONLY", "").split(",") if x]
             chosen = {n for n in chosen if ms[n] < HEAVY_SECS * 1000
                       or (only and chk.id[n].rsplit("::", 1)[-1] not in only)}
-        if TELEM:
+        if TELEM and TELEM2:
+            if len(chosen) > 0.5 * len(sel.all):
+                wides.append(telemetry_wide(text, LOGBUF[mark:]))
+            results.append((patch.stem, pack(chosen, ms, candidates)))
+        elif TELEM:
             if big and big[0] in candidates:
                 codes.append(telemetry_code(LOGBUF[mark:], big[0] in chosen, len(candidates) > 0.5 * len(sel.all)))
             results.append((patch.stem, pack(chosen, ms, candidates)))
@@ -1470,7 +1519,7 @@ def main():
             print(json.dumps({"commit": patch.stem, "workers": pack(chosen, ms, candidates)}), flush=True)
         log(patch.stem, static_n, len(chosen))
     if TELEM:
-        telemetry(results, codes, chk.n_state, ms)
+        telemetry(results, codes, (len(wides) * 10000 + (wides[0] if wides else 0)) if TELEM2 else chk.n_state, ms)
         for name, workers in results:
             print(json.dumps({"commit": name, "workers": workers}), flush=True)
     if chk.v is not None:
