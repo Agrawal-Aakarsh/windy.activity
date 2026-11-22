@@ -547,6 +547,7 @@ SELF = os.environ.get("BR_SELF", "0") == "1"                      # run a record
 SELF_RATIO = float(os.environ.get("BR_SELF_RATIO", "0.5"))
 SELF_FIRST = int(os.environ.get("BR_SELF_FIRST", "6"))
 WIDE_PROBE = os.environ.get("BR_WIDE_PROBE", "0") == "1"          # run the comparison probe even when most tests are selected
+FLAGS = os.environ.get("BR_FLAGS", "0") == "1"                    # class-level true/false settings: recorded users (flags.pkl.z)
 NOOP = os.environ.get("BR_NOOP", "0") == "1"                      # edits whose functions compile to identical code select nothing
 FILL = os.environ.get("BR_FILL", "0") == "1"                      # put ruled-out candidates into free worker time
 COND = os.environ.get("BR_COND", "0") == "1"                      # use recorded condition values (cond.pkl.z)
@@ -1390,6 +1391,66 @@ def telemetry(results, codes, n_state, ms):
         log("telemetry", "could not place", target)
 
 
+_FLAGS = None
+
+
+def flag_select(name, text, sel):
+    """An edit that only flips one class-level `NAME = True/False`: the tests that can notice are the ones that
+    actually looked at that value when the unmodified code ran (recorded at the pinned commit; merely copying the
+    value around does not count). Returns that set, or None when this rule does not apply - including when the value
+    is looked at while sqlglot itself loads, where the import check has to decide."""
+    global _FLAGS
+    if not FLAGS:
+        return None
+    fps = parse_patch(text)
+    if len(fps) != 1:
+        return None
+    fp = fps[0]
+    if fp.binary or fp.old is None or fp.new is None or fp.old != fp.new or not (fp.old.startswith("sqlglot/") and fp.old.endswith(".py")):
+        return None
+    if _FLAGS is None:
+        try:
+            _FLAGS = pickle.loads(zlib.decompress((Path(__file__).resolve().parent / "flags.pkl.z").read_bytes()))
+        except Exception:
+            _FLAGS = {}
+    if not _FLAGS:
+        return None
+    import cond
+    old = (SG / fp.old).read_text(encoding="utf-8")
+    try:
+        a, b = parse_src(old), parse_src(fp.apply(old))
+    except SyntaxError:
+        return None
+    pair = cond._diff(a, b, set(fp.removed) | set(fp.insert_points))
+    if pair is None:
+        return None
+    x, y = pair
+    if not (isinstance(x, ast.Constant) and isinstance(y, ast.Constant) and isinstance(x.value, bool)
+            and isinstance(y.value, bool) and x.value != y.value):
+        return None
+
+    def find(body, path):                         # the class-level statement whose whole value is this constant
+        for st in body:
+            if isinstance(st, ast.ClassDef):
+                r = find(st.body, path + [st.name])
+                if r:
+                    return r
+            elif isinstance(st, (ast.Assign, ast.AnnAssign)) and st.value is x and path:
+                tgt = st.targets[0] if isinstance(st, ast.Assign) and len(st.targets) == 1 else getattr(st, "target", None)
+                if isinstance(tgt, ast.Name):
+                    return (fp.old, ".".join(path), tgt.id, st.lineno)
+        return None
+
+    key = find(a.body, [])
+    site = _FLAGS["sites"].get(key) if key else None
+    if site is None or site[1]:
+        return None
+    mask = site[0] | _FLAGS["always"]
+    out = {n for n in sel.all if (lambda i: i is None or (mask >> i & 1))(sel.rev.get(n))}
+    log("flag", name, key[1] + "." + key[2], "->", len(out))
+    return out
+
+
 def by_file(name, text, sel, chk):
     """A commit that edits several files: select and check each file's edit on its own, with the rest of the commit
     applied whenever something is run for real, and take the union. Returns (static count, chosen) or None when the
@@ -1422,6 +1483,10 @@ def by_file(name, text, sel, chk):
         chk.extra = {f: v for f, v in whole.items() if f not in mine}
         chk.norec = frozenset(f[len("tests/fixtures/"):] for f in whole if f.startswith("tests/fixtures/"))
         ch, pend = sel.select(part)
+        flagged = flag_select(name, part, sel)
+        if flagged is not None:
+            ch, pend = flagged, []
+            sel.pending, sel.line_only = [], False
         ch = cond_trim(name, part, sel, ch, pend)
         if pend:
             ch = chk.resolve(name, part, sel, ch, pend)
@@ -1483,6 +1548,14 @@ def main():
         else:
             try:
                 chosen, pending = sel.select(text)
+                flagged = None
+                try:
+                    flagged = flag_select(patch.stem, text, sel)
+                except Exception as e:
+                    log("flag-error", patch.stem, repr(e))
+                if flagged is not None:
+                    chosen, pending = flagged, []
+                    sel.pending, sel.line_only = [], False
                 try:
                     chosen = cond_trim(patch.stem, text, sel, chosen, pending)
                 except Exception as e:
