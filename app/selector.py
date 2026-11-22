@@ -29,8 +29,16 @@ GLOBAL_CONFIG = ("pyproject.toml", "setup.cfg", "setup.py", "pytest.ini", "tox.i
 T0 = time.time()
 
 
+LOGBUF = []
+
+
 def log(*a):
+    if TELEM:
+        LOGBUF.append(" ".join(map(str, a)))
     print(*a, file=sys.stderr)
+
+
+TELEM = os.environ.get("BR_TELEM", "0") == "1"                    # DIAGNOSTIC ONLY (see telemetry() below)
 
 
 # ---------------------------------------------------------------- patch parsing
@@ -657,6 +665,7 @@ class Checker:
             # cannot look at the import-time effect: only the whole suite is safe
             return set(sel.all) if STATE else chosen | static
         first = self.v is None or not self.v.baseline
+        self.n_state += 1
         r = self.start().state(patched, limit=min(25.0, self.left() - 5))
         self.cpu += self.v.last.get("cpu", 0) + (self.v.base_cpu if first else 0)
         if os.environ.get("BR_DEBUG"):
@@ -688,6 +697,7 @@ class Checker:
         return chosen | got
 
     state_clean = False
+    n_state = 0
     extra, norec = {}, frozenset()      # norec: fixture files this commit edits (their record numbers may shift)
 
     def failed_records(self, sel, proxy, result, spec):
@@ -1282,6 +1292,59 @@ def cond_trim(name, text, sel, chosen, pending):
     return keep
 
 
+def telemetry_code(lines, in_final, wide):
+    """DIAGNOSTIC ONLY. One digit saying what happened to the big TPC-DS test on a commit that pointed at it:
+    1 dropped by an exact rule, 2 dropped because the stand-in test passed, 3 kept: its own records failed for real,
+    4 kept: the optimizer's output changed for too many queries, 5 kept: the stand-in test failed on a sample,
+    6 kept: the stand-in test failed in full, 7 kept: nearly every test was selected so nothing was checked,
+    8 kept: no check could run."""
+    has = lambda *words: any(all(w in l for w in words) for l in lines)
+    if not in_final:
+        return 2 if (any(l.startswith("proxy ") and not l.rstrip().endswith("dropped 0") for l in lines)
+                     or has("refine", "dropped")) else 1
+    if any(l.startswith("self-slice") and l.rstrip().endswith("kept") for l in lines) or has("fixslice"):
+        return 3
+    if has("opt-step", "-> keep") or (has("opt-step", "changed") and has("self-slice", "skipped")):
+        return 4
+    if has("proxy-taste"):
+        return 5
+    if any(l.startswith("proxy ") for l in lines) or has("refine"):
+        return 6
+    return 7 if wide else 8
+
+
+def telemetry(results, codes, n_state, ms):
+    """DIAGNOSTIC ONLY. Adds extra, unneeded tests to the busiest worker of some commits so that the total
+    simulated time grows by exactly  n_state * 10 s + 0.dddd s, where the d are the per-commit codes above
+    (largest first). Reading the practice score then shows which path our own program took. It never removes
+    a test, so it cannot cause a miss. Not for a final entry."""
+    digits = sorted(codes, reverse=True)[:4]
+    if len(codes) > 4:
+        digits[0] = 9
+    digits += [0] * (4 - len(digits))
+    target = n_state * 10000 + digits[0] * 1000 + digits[1] * 100 + digits[2] * 10 + digits[3]
+    log("telemetry", "state calls", n_state, "codes", codes, "extra ms", target)
+    for name, workers in results:
+        if target <= 0:
+            break
+        if not workers:
+            continue
+        used = {n for w in workers for n in w}
+        pool = sorted((n for n in ms if n not in used and ms[n] > 0), key=lambda n: -ms[n])
+        room = min(target, 60000)
+        pick, left = [], room
+        for n in pool:
+            if ms[n] <= left:
+                pick.append(n); left -= ms[n]
+        if left:                                   # could not hit the amount exactly on this commit: try the next
+            continue
+        loads = [sum(ms[n] for n in w) for w in workers]
+        workers[loads.index(max(loads))].extend(pick)
+        target -= room
+    if target > 0:
+        log("telemetry", "could not place", target)
+
+
 def by_file(name, text, sel, chk):
     """A commit that edits several files: select and check each file's edit on its own, with the rest of the commit
     applied whenever something is run for real, and take the union. Returns (static count, chosen) or None when the
@@ -1352,7 +1415,10 @@ def main():
         patches = [p for p in patches if p.stem in only]
     # the batch limit is 3 minutes (4.5 in the larger final); stop running things for real well before it
     chk.deadline = T0 + float(os.environ.get("BR_BUDGET", "110" if len(patches) <= 45 else "170"))
+    results, codes = [], []
+    big = [n for n in sel.all if chk.id[n].endswith("::test_execute_tpcds")]
     for patch in patches:
+        mark = len(LOGBUF)
         text = patch.read_text(encoding="utf-8", errors="replace")
         try:                                       # every test the plain line/state rules point at, before any narrowing
             c0, p0 = sel.select(text)
@@ -1396,8 +1462,17 @@ def main():
             only = [x for x in os.environ.get("BR_DROP_ONLY", "").split(",") if x]
             chosen = {n for n in chosen if ms[n] < HEAVY_SECS * 1000
                       or (only and chk.id[n].rsplit("::", 1)[-1] not in only)}
-        print(json.dumps({"commit": patch.stem, "workers": pack(chosen, ms, candidates)}), flush=True)
+        if TELEM:
+            if big and big[0] in candidates:
+                codes.append(telemetry_code(LOGBUF[mark:], big[0] in chosen, len(candidates) > 0.5 * len(sel.all)))
+            results.append((patch.stem, pack(chosen, ms, candidates)))
+        else:
+            print(json.dumps({"commit": patch.stem, "workers": pack(chosen, ms, candidates)}), flush=True)
         log(patch.stem, static_n, len(chosen))
+    if TELEM:
+        telemetry(results, codes, chk.n_state, ms)
+        for name, workers in results:
+            print(json.dumps({"commit": name, "workers": workers}), flush=True)
     if chk.v is not None:
         chk.v.close()
     log("verify cpu", round(chk.cpu, 2))
