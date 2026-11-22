@@ -935,6 +935,24 @@ class Checker:
         if SELF and heavy and self.left() > 25:
             for hv in sorted(heavy, key=lambda n: -self.ms[n]):
                 got = self.self_slice(sel, hv)
+                if COND and getattr(sel, "cond_applied", False):
+                    # a one-condition edit: the recorded values say, query by query, where the old and the new
+                    # condition could disagree. Only those records can behave differently.
+                    try:
+                        import cond
+                        fp0 = parse_patch(text)[0]
+                        old0 = (SG / fp0.old).read_text(encoding="utf-8")
+                        crec = cond.touched_records(sel.rev.get(hv), fp0.old, old0, fp0.apply(old0), parse_src,
+                                                    set(fp0.removed) | set(fp0.insert_points))
+                    except Exception:
+                        crec = None
+                    info0 = (sel.m.get("selfrec", {}).get(sel.rev.get(hv)) or {}).get(crec[0]) if crec else None
+                    if crec and crec[1] and info0 and crec[0] not in self.norec:
+                        if got:
+                            got = (got[0], [i for i in got[1] if i in set(crec[1])] or list(crec[1]), got[2], got[3])
+                        else:
+                            got = (crec[0], list(crec[1]), info0["cpu"], None)
+                        log("cond-records", name, len(crec[1]))
                 if not got:
                     continue
                 fx, idxs, costs, inner = got

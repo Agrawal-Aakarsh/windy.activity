@@ -25,6 +25,18 @@ def data():
     return _DATA
 
 
+def touched_records(test_index, rel, old_src, new_src, parse=ast.parse, lines=None):
+    """For a test that loops over fixture records and was recorded one record at a time: (fixture, sorted indexes of
+    the records in which the old and the new condition could ever disagree), or None when not available."""
+    info = data().get("rec", {}).get(test_index)
+    if not info:
+        return None
+    r = touched(rel, old_src, new_src, parse, lines, info["obs"])
+    if r is None:
+        return None
+    return info["fx"], [i for i in range(info["n"]) if r[0] >> i & 1]
+
+
 def _clean(node, lines):
     """True when the patch changes no line of this node (old file line numbers), so it cannot differ."""
     if lines is None:
@@ -187,7 +199,7 @@ def _skip(node, dumps, pos):
             _skip(v, dumps, pos)
 
 
-def touched(rel, old_src, new_src, parse=ast.parse, lines=None):
+def touched(rel, old_src, new_src, parse=ast.parse, lines=None, obs=None):
     """(mask of tests that may behave differently, mask of tests the recorder has data for, description) or None
     when the edit is not a one-condition edit this module understands."""
     d = data()
@@ -204,7 +216,8 @@ def touched(rel, old_src, new_src, parse=ast.parse, lines=None):
     x, y = pair
     if not hasattr(x, "lineno"):
         return None
-    obs = d["obs"]
+    if obs is None:
+        obs = d["obs"]                # per test; a caller may pass per-record observations of one test instead
 
     def site(node, kind):
         s = table.get((node.lineno, node.col_offset, node.end_lineno, node.end_col_offset, kind))
